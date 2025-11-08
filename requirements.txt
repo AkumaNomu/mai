@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+torch
+spotipy
+openai
+python-dotenv
+requests
+tqdm
+streamlit
