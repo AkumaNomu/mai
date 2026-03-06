@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SceneContextInput",
+  "type": "object",
+  "required": ["scenes"],
+  "properties": {
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "context"],
+        "properties": {
+          "id": { "type": "string" },
+          "context": { "type": "string" },
+          "frames_path": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
