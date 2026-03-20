@@ -1,5 +1,8 @@
 .venv/
 __pycache__/
+.pytest_cache/
 *.pyc
 .env
 data/
+mai_playlist_flow.ipynb
+cookies.txt

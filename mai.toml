@@ -1,0 +1,151 @@
+[cache]
+root_dir = "data/cache"
+audio_dir = "data/audio_cache"
+
+[analysis]
+refresh_cache = false
+edge_seconds = 30.0
+silence_top_db = 35.0
+flow_profile = "deep-dj"
+download_workers = 4
+analysis_workers = 12
+delete_audio_after_analysis = true
+no_audio_analysis = false
+
+[generation]
+num_playlists = 1
+allow_reuse = false
+genre_clusters = 8
+beam_width = 8
+candidate_width = 25
+rate_transitions = true
+print_recommended_order = true
+
+[training]
+output_path = "data/training/positive_transitions.csv"
+max_search_results = 5
+metadata_workers = 4
+search_workers = 4
+label = "excellent"
+label_source = "youtube_mix_curation"
+
+[[training.channels]]
+name = "mai"
+url = "https://www.youtube.com/@mai_dq/videos"
+label = "excellent"
+label_source = "mai_dq_mix_curation"
+
+[[training.channels]]
+name = "take your time"
+url = "https://www.youtube.com/@nohurrydontworry/videos"
+label = "good"
+label_source = "nohurrydontworry_mix_curation"
+
+
+[[training.channels]]
+name = "긴"
+url = "https://www.youtube.com/@Kyoginto/videos"
+label = "excellent"
+label_source = "kyoginto_mix_curation"
+
+
+[[training.channels]]
+name = "mentaldisorders"
+url = "https://www.youtube.com/@mentaldisorders_/videos"
+label = "strong"
+label_source = "mentaldisorders_mix_curation"
+
+
+[[training.channels]]
+name = "ewaa"
+url = "https://www.youtube.com/@ewaaofficial/videos"
+label = "excellent"
+label_source = "ewaa_mix_curation"
+
+[[training.channels]]
+name = "rhawn"
+url = "https://www.youtube.com/@im_rhawn_ok/videos"
+label = "excellent"
+label_source = "rhawn_mix_curation"
+
+[[training.channels]]
+name = "nellaiiiii"
+url = "https://www.youtube.com/channel/UCIDeef7eQBUmWMEeiHRhxPg/videos"
+label = "good"
+label_source = "nellaiiiii_mix_curation"
+
+[[training.channels]]
+name = "thermosento"
+url = "https://www.youtube.com/@thermosento/videos"
+label = "excellent"
+label_source = "thermosento_mix_curation"
+
+[[training.channels]]
+name = "YukiV4554"
+url = "https://www.youtube.com/@yukiv4554/videos"
+label = "excellent"
+label_source = "yukiv4554_mix_curation"
+
+[[training.videos]]
+name = "LzRbilDcyFQ"
+url = "https://www.youtube.com/watch?v=LzRbilDcyFQ"
+label = "good"
+label_source = "manual_video_curation"
+
+[[training.videos]]
+name = "NnPpWUefnwA"
+url = "https://www.youtube.com/watch?v=NnPpWUefnwA"
+label = "good"
+label_source = "manual_video_curation"
+
+[[training.videos]]
+name = "6HoFfkvl3vU"
+url = "https://www.youtube.com/watch?v=6HoFfkvl3vU"
+label = "good"
+label_source = "manual_video_curation"
+
+
+[[training.videos]]
+name = "hYWJrZ4G6o8"
+url = "https://www.youtube.com/watch?v=hYWJrZ4G6o8"
+label = "strong"
+label_source = "manual_video_curation"
+
+[[training.videos]]
+name = "coZqAEkze2I"
+url = "https://www.youtube.com/watch?v=coZqAEkze2I"
+label = "strong"
+label_source = "manual_video_curation"
+
+[[training.videos]]
+name = "0aw93iNk0vY"
+url = "https://www.youtube.com/watch?v=0aw93iNk0vY"
+label = "good"
+label_source = "manual_video_curation"
+
+[[training.videos]]
+name = "GrxoeQfZ0HE"
+url = "https://www.youtube.com/watch?v=GrxoeQfZ0HE"
+label = "excellent"
+label_source = "manual_video_curation"
+
+[[training.videos]]
+name = "CWDNxaU7zus"
+url = "https://www.youtube.com/watch?v=CWDNxaU7zus"
+label = "good"
+label_source = "manual_video_curation"
+
+
+[exports.ytmusic]
+auth_path = "data/ytmusic_auth.json"
+title = "auto"
+privacy = "PRIVATE"
+
+[exports.youtube]
+client_secrets_path = "data/youtube_client_secret.json"
+token_path = "data/youtube_token.json"
+title = "auto"
+privacy = "unlisted"
+
+[logging]
+level = "INFO"
