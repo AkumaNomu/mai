@@ -152,18 +152,18 @@ Bookkeeping columns:
 - `intro_leading_silence_s`
 - `outro_trailing_silence_s`
 
-Mai also caches extracted feature rows globally in `data/cache/audio_features.csv`.
+Mai also caches extracted feature rows globally in `data/cache/audio_features.sqlite`.
 
 Each cache row stores:
 - `video_id`
 - compact `analysis_signature` for the analysis settings
 - derived `sentiment_*` columns alongside the audio features
 
-Mai loads that CSV once per run and indexes it in memory by `video_id + analysis_signature` for fast cache lookup while analyzing a playlist.
+Mai loads that SQLite-backed table once per run and indexes it in memory by `video_id + analysis_signature` for fast cache lookup while analyzing a playlist.
 If a row exists for the same `video_id` with matching settings, Mai reuses it instead of decoding the audio again.
 If the settings differ, Mai can keep a separate row for that alternate signature instead of bloating every row with repeated config metadata.
 
-Legacy per-video JSON cache files under `data/cache/audio_features/` are treated as a migration source and imported into the CSV when needed.
+Legacy per-video JSON cache files under `data/cache/audio_features/` are treated as a migration source and imported into SQLite when needed.
 
 ### Base song, intro, and outro features
 
@@ -469,9 +469,9 @@ Mai also has a training-data scraper for building positive transition labels fro
 - fetches and caches each source video's full metadata payload under `data/cache/training/video_metadata`
 - builds source-track rows from description timestamps first
 - falls back to watch-page chapter/music metadata when descriptions are missing or insufficient
-- caches normalized parsed source-track rows in `data/cache/training/source_tracks.csv`
+- caches normalized parsed source-track rows in `data/cache/training/source_tracks.sqlite`
 - searches YouTube for the listed songs and caches raw search payloads under `data/cache/training/search_results`
-- caches per-track resolution outcomes in `data/cache/training/track_resolutions.csv`
+- caches per-track resolution outcomes in `data/cache/training/track_resolutions.sqlite`
 - runs the same audio analysis pipeline used for normal playlist inputs
 - writes one `excellent` row per adjacent song handoff in the original mix order
 
@@ -479,7 +479,7 @@ Balanced scraping speedups include:
 - a bounded worker pool for source-video metadata fetches
 - a bounded worker pool for track searches
 - in-run deduplication of repeated normalized search queries
-- batched writes to `source_tracks.csv` and `track_resolutions.csv`
+- batched writes to `source_tracks.sqlite` and `track_resolutions.sqlite`
 
 `training.max_search_results` is the per-track YouTube candidate cap used during resolution.
 The default `5` keeps search broad enough to avoid many weak first hits without turning each row into an expensive candidate sweep.

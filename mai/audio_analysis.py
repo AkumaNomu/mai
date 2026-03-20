@@ -1,5 +1,6 @@
 import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import ctypes
 import glob
 import json
 import logging
@@ -14,12 +15,24 @@ import librosa
 from yt_dlp import YoutubeDL
 
 from .sentiment import add_sentiment_features
+from .tabular_cache import read_sqlite_table, resolve_sqlite_cache_path, write_sqlite_table
 from .yt_dlp_auth import apply_yt_dlp_auth_options, ensure_yt_dlp_ffmpeg_location
 
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, int, int, str], None]
 _TEMP_AUDIO_CACHE_SUFFIXES = {'.part', '.tmp', '.temp', '.ytdl'}
+_RESOURCE_PROFILE_DEFAULT = 'default'
+_RESOURCE_PROFILE_BACKGROUND = 'background'
+_RESOURCE_PROFILE_CHOICES = (_RESOURCE_PROFILE_DEFAULT, _RESOURCE_PROFILE_BACKGROUND)
+_BACKGROUND_THREAD_ENV_VARS = (
+    'OMP_NUM_THREADS',
+    'OPENBLAS_NUM_THREADS',
+    'MKL_NUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+    'VECLIB_MAXIMUM_THREADS',
+    'BLIS_NUM_THREADS',
+)
 
 _FEATURE_CACHE_VERSION = 1
 _FEATURE_CACHE_KEY_COLUMN = 'video_id'
@@ -54,7 +67,8 @@ _FEATURE_CACHE_CONTEXT_SOURCE_COLUMNS = [
     'tags',
     'category',
 ]
-_DEFAULT_FEATURE_CACHE_CSV_PATH = os.path.join('data', 'cache', 'audio_features.csv')
+_DEFAULT_FEATURE_CACHE_DB_PATH = os.path.join('data', 'cache', 'audio_features.sqlite')
+_FEATURE_CACHE_TABLE_NAME = 'audio_features'
 
 
 def _ensure_ffmpeg_dir(cache_root: str) -> Optional[str]:
@@ -75,6 +89,61 @@ def _emit_progress(
 def _worker_count(requested_workers: int, total_items: int) -> int:
     requested = max(int(requested_workers or 1), 1)
     return max(1, min(requested, max(int(total_items), 1)))
+
+
+def _normalize_resource_profile(resource_profile: str | None) -> str:
+    normalized = str(resource_profile or _RESOURCE_PROFILE_DEFAULT).strip().lower()
+    return normalized if normalized in _RESOURCE_PROFILE_CHOICES else _RESOURCE_PROFILE_DEFAULT
+
+
+def _resolve_analysis_resource_settings(
+    *,
+    download_workers: int,
+    analysis_workers: int,
+    resource_profile: str | None,
+) -> dict[str, int | str | bool]:
+    normalized_profile = _normalize_resource_profile(resource_profile)
+    effective_download_workers = max(int(download_workers or 1), 1)
+    effective_analysis_workers = max(int(analysis_workers or 1), 1)
+    force_process_pool = False
+    if normalized_profile == _RESOURCE_PROFILE_BACKGROUND:
+        effective_download_workers = 1
+        effective_analysis_workers = 1
+        force_process_pool = True
+    return {
+        'resource_profile': normalized_profile,
+        'download_workers': effective_download_workers,
+        'analysis_workers': effective_analysis_workers,
+        'force_process_pool': force_process_pool,
+    }
+
+
+def _prepare_background_worker_environment(resource_profile: str | None) -> None:
+    if _normalize_resource_profile(resource_profile) != _RESOURCE_PROFILE_BACKGROUND:
+        return
+    for env_var in _BACKGROUND_THREAD_ENV_VARS:
+        os.environ[env_var] = '1'
+
+
+def _lower_current_process_priority() -> None:
+    if os.name == 'nt':
+        try:
+            BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.kernel32.SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS)
+        except Exception:
+            return
+        return
+    try:
+        os.nice(10)
+    except OSError:
+        return
+
+
+def _initialize_analysis_worker(resource_profile: str | None) -> None:
+    if _normalize_resource_profile(resource_profile) != _RESOURCE_PROFILE_BACKGROUND:
+        return
+    _lower_current_process_priority()
 
 
 def _clip01(value: float) -> float:
@@ -193,6 +262,14 @@ def _task_display_label(video_id: str, metadata: Optional[dict] = None) -> str:
     return str(video_id)
 
 
+def _task_progress_detail(video_id: str, metadata: Optional[dict] = None) -> str:
+    display = _task_display_label(video_id, metadata)
+    normalized_video_id = str(video_id).strip()
+    if display and display != normalized_video_id:
+        return f'{normalized_video_id} | {display}'
+    return normalized_video_id
+
+
 def _augment_feature_payload(features: dict) -> dict:
     feature_df = add_sentiment_features(pd.DataFrame([features]))
     return {key: _serialize_cache_value(value) for key, value in feature_df.iloc[0].to_dict().items()}
@@ -205,23 +282,15 @@ def _augment_feature_cache_table(cache_df: pd.DataFrame) -> pd.DataFrame:
     return add_sentiment_features(cache_df.copy())
 
 
-def _resolve_feature_cache_paths(feature_cache_dir: Optional[str]) -> tuple[str, Optional[str]]:
-    if feature_cache_dir:
-        feature_cache_location = os.path.normpath(str(feature_cache_dir))
-        if feature_cache_location.lower().endswith('.csv'):
-            feature_cache_csv_path = feature_cache_location
-            legacy_feature_cache_dir = os.path.splitext(feature_cache_location)[0]
-        else:
-            feature_cache_csv_path = f'{feature_cache_location}.csv'
-            legacy_feature_cache_dir = feature_cache_location
-    else:
-        feature_cache_csv_path = _DEFAULT_FEATURE_CACHE_CSV_PATH
-        legacy_feature_cache_dir = os.path.splitext(feature_cache_csv_path)[0]
-
+def _resolve_feature_cache_paths(feature_cache_dir: Optional[str]) -> tuple[str, str, Optional[str]]:
+    feature_cache_db_path, legacy_feature_cache_csv_path = resolve_sqlite_cache_path(
+        feature_cache_dir,
+        default_path=_DEFAULT_FEATURE_CACHE_DB_PATH,
+    )
+    legacy_feature_cache_dir = os.path.splitext(legacy_feature_cache_csv_path)[0]
     if not legacy_feature_cache_dir or not os.path.isdir(legacy_feature_cache_dir):
         legacy_feature_cache_dir = None
-
-    return feature_cache_csv_path, legacy_feature_cache_dir
+    return feature_cache_db_path, legacy_feature_cache_csv_path, legacy_feature_cache_dir
 
 
 def _feature_cache_record(
@@ -285,12 +354,23 @@ def _prepare_feature_cache_table(cache_df: Optional[pd.DataFrame]) -> pd.DataFra
     return prepared.reindex(columns=ordered_columns)
 
 
-def _read_feature_cache_table(feature_cache_csv_path: str) -> pd.DataFrame:
-    if not feature_cache_csv_path or not os.path.exists(feature_cache_csv_path):
+def _read_feature_cache_table(feature_cache_path: str) -> pd.DataFrame:
+    if not feature_cache_path or not os.path.exists(feature_cache_path):
         return pd.DataFrame(columns=_FEATURE_CACHE_RESERVED_COLUMNS)
+    if str(feature_cache_path).lower().endswith(('.sqlite', '.db')):
+        try:
+            cache_df = read_sqlite_table(
+                feature_cache_path,
+                columns=_FEATURE_CACHE_RESERVED_COLUMNS,
+                table_name=_FEATURE_CACHE_TABLE_NAME,
+            )
+        except Exception as exc:
+            logger.warning('Failed to read audio feature cache DB %s: %r', feature_cache_path, exc)
+            return pd.DataFrame(columns=_FEATURE_CACHE_RESERVED_COLUMNS)
+        return _prepare_feature_cache_table(cache_df)
     try:
         cache_df = pd.read_csv(
-            feature_cache_csv_path,
+            feature_cache_path,
             dtype={
                 _FEATURE_CACHE_KEY_COLUMN: str,
                 _FEATURE_CACHE_SIGNATURE_COLUMN: str,
@@ -301,16 +381,25 @@ def _read_feature_cache_table(feature_cache_csv_path: str) -> pd.DataFrame:
     except pd.errors.EmptyDataError:
         return pd.DataFrame(columns=_FEATURE_CACHE_RESERVED_COLUMNS)
     except Exception as exc:
-        logger.warning('Failed to read audio feature cache CSV %s: %r', feature_cache_csv_path, exc)
+        logger.warning('Failed to read audio feature cache CSV %s: %r', feature_cache_path, exc)
         return pd.DataFrame(columns=_FEATURE_CACHE_RESERVED_COLUMNS)
     return _prepare_feature_cache_table(cache_df)
 
 
-def _write_feature_cache_table(cache_df: pd.DataFrame, feature_cache_csv_path: str) -> None:
-    if not feature_cache_csv_path:
+def _write_feature_cache_table(cache_df: pd.DataFrame, feature_cache_path: str) -> None:
+    if not feature_cache_path:
         return
     prepared = _prepare_feature_cache_table(cache_df)
-    directory = os.path.dirname(feature_cache_csv_path)
+    if str(feature_cache_path).lower().endswith(('.sqlite', '.db')):
+        write_sqlite_table(
+            feature_cache_path,
+            prepared,
+            columns=prepared.columns.tolist() or _FEATURE_CACHE_RESERVED_COLUMNS,
+            table_name=_FEATURE_CACHE_TABLE_NAME,
+            key_columns=_FEATURE_CACHE_RESERVED_COLUMNS,
+        )
+        return
+    directory = os.path.dirname(feature_cache_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     temp_dir = directory or '.'
@@ -322,7 +411,7 @@ def _write_feature_cache_table(cache_df: pd.DataFrame, feature_cache_csv_path: s
     os.close(temp_handle)
     try:
         prepared.to_csv(temp_path, index=False)
-        os.replace(temp_path, feature_cache_csv_path)
+        os.replace(temp_path, feature_cache_path)
     finally:
         if os.path.exists(temp_path):
             try:
@@ -405,19 +494,30 @@ def _merge_missing_legacy_feature_cache_rows(
 def _load_feature_cache_table(
     feature_cache_dir: Optional[str],
 ) -> tuple[pd.DataFrame, str]:
-    feature_cache_csv_path, legacy_feature_cache_dir = _resolve_feature_cache_paths(feature_cache_dir)
-    cache_df = _read_feature_cache_table(feature_cache_csv_path)
+    feature_cache_db_path, legacy_feature_cache_csv_path, legacy_feature_cache_dir = _resolve_feature_cache_paths(feature_cache_dir)
+    cache_df = _read_feature_cache_table(feature_cache_db_path)
+    if cache_df.empty and legacy_feature_cache_csv_path and os.path.exists(legacy_feature_cache_csv_path):
+        cache_df = _read_feature_cache_table(legacy_feature_cache_csv_path)
     legacy_cache_df = _load_legacy_feature_cache_rows(legacy_feature_cache_dir)
     cache_df, imported_rows = _merge_missing_legacy_feature_cache_rows(cache_df, legacy_cache_df)
-    if imported_rows > 0:
+    should_persist_cache = (
+        imported_rows > 0
+        or (
+            legacy_feature_cache_csv_path
+            and legacy_feature_cache_csv_path != feature_cache_db_path
+            and os.path.exists(legacy_feature_cache_csv_path)
+            and not os.path.exists(feature_cache_db_path)
+        )
+    )
+    if should_persist_cache:
         logger.info(
             'Imported %d legacy audio feature cache row(s) from %s into %s.',
             imported_rows,
             legacy_feature_cache_dir,
-            feature_cache_csv_path,
+            feature_cache_db_path,
         )
-        _write_feature_cache_table(cache_df, feature_cache_csv_path)
-    return cache_df, feature_cache_csv_path
+        _write_feature_cache_table(cache_df, feature_cache_db_path)
+    return cache_df, feature_cache_db_path
 
 
 def _cached_features_from_row(cache_row: pd.Series) -> dict:
@@ -965,11 +1065,24 @@ def analyze_audio_cache_directory(
     edge_seconds: float = 30.0,
     silence_top_db: float = 35.0,
     flow_profile: str = 'deep-dj',
+    resource_profile: str = _RESOURCE_PROFILE_DEFAULT,
     refresh_cache: bool = False,
     analysis_workers: int = 1,
     delete_audio_after_analysis: bool = True,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int | str]]:
+    resource_settings = _resolve_analysis_resource_settings(
+        download_workers=1,
+        analysis_workers=analysis_workers,
+        resource_profile=resource_profile,
+    )
+    resource_profile = str(resource_settings['resource_profile'])
+    analysis_workers = int(resource_settings['analysis_workers'])
+    force_process_pool = bool(resource_settings['force_process_pool'])
+    _prepare_background_worker_environment(resource_profile)
+    if resource_profile == _RESOURCE_PROFILE_BACKGROUND:
+        logger.info('Background audio analysis enabled: using %d low-priority analysis worker.', analysis_workers)
+
     audio_root = Path(str(audio_cache_dir))
     feature_cache_df, feature_cache_csv_path = _load_feature_cache_table(feature_cache_dir)
     feature_cache_lookup = _build_feature_cache_lookup(feature_cache_df)
@@ -1020,7 +1133,7 @@ def analyze_audio_cache_directory(
             'Scanning local audio cache',
             file_number,
             max(total_files, 1),
-            f'{video_id} queued from {audio_path.name}',
+            f'{video_id} discovered in local audio cache',
         )
 
     summary['unique_tracks_found'] = int(len(grouped_paths))
@@ -1053,7 +1166,7 @@ def analyze_audio_cache_directory(
                     'Checking feature cache',
                     track_number,
                     total_tracks,
-                    f'{video_id} cache hit',
+                    f'{_task_progress_detail(video_id)} audio cache hit',
                 )
                 continue
         pending_tasks.append({
@@ -1067,7 +1180,7 @@ def analyze_audio_cache_directory(
             'Checking feature cache',
             track_number,
             total_tracks,
-            f'{video_id} needs analysis',
+            f'{_task_progress_detail(video_id)} queued for analysis',
         )
 
     if pending_tasks:
@@ -1081,7 +1194,7 @@ def analyze_audio_cache_directory(
             max(total_pending, 1),
             f'starting {total_pending} tracks with {max_analysis_workers} workers',
         )
-        if max_analysis_workers == 1:
+        if max_analysis_workers == 1 and not force_process_pool:
             for task_number, task in enumerate(pending_tasks, start=1):
                 video_id = str(task['video_id'])
                 try:
@@ -1103,6 +1216,7 @@ def analyze_audio_cache_directory(
                         'audio_path': str(task['audio_path']),
                         'analysis_status': 'failed',
                     })
+                    progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analysis failed'
                 else:
                     cache_record = _feature_cache_record(
                         video_id=video_id,
@@ -1124,16 +1238,21 @@ def analyze_audio_cache_directory(
                         summary['audio_files_deleted'] += _delete_audio_cache_files(list(task.get('audio_paths') or []))
                     else:
                         summary['audio_files_kept'] += len(list(task.get('audio_paths') or []))
+                    progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analyzed'
                 _emit_progress(
                     progress_callback,
                     'Analyzing local audio cache',
                     task_number,
                     total_pending,
-                    str(task['video_id']),
+                    progress_detail,
                 )
         else:
             future_map = {}
-            with ProcessPoolExecutor(max_workers=max_analysis_workers) as executor:
+            with ProcessPoolExecutor(
+                max_workers=max_analysis_workers,
+                initializer=_initialize_analysis_worker,
+                initargs=(resource_profile,),
+            ) as executor:
                 for task in pending_tasks:
                     future = executor.submit(
                         _analyze_audio_worker,
@@ -1158,6 +1277,7 @@ def analyze_audio_cache_directory(
                             'audio_path': str(task['audio_path']),
                             'analysis_status': 'failed',
                         })
+                        progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analysis failed'
                     else:
                         cache_record = _feature_cache_record(
                             video_id=video_id,
@@ -1175,6 +1295,7 @@ def analyze_audio_cache_directory(
                         analyzed_row['audio_path'] = str(task['audio_path'])
                         analyzed_row['analysis_status'] = 'analyzed'
                         result_rows.append(analyzed_row)
+                        progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analyzed'
                     if delete_audio_after_analysis:
                         summary['audio_files_deleted'] += _delete_audio_cache_files(list(task.get('audio_paths') or []))
                     else:
@@ -1184,7 +1305,7 @@ def analyze_audio_cache_directory(
                         'Analyzing local audio cache',
                         completed,
                         total_pending,
-                        video_id,
+                        progress_detail,
                     )
         if cache_records:
             feature_cache_df = _upsert_feature_cache_records(
@@ -1223,12 +1344,30 @@ def analyze_youtube_playlist_audio(
     edge_seconds: float = 30.0,
     silence_top_db: float = 35.0,
     flow_profile: str = 'deep-dj',
+    resource_profile: str = _RESOURCE_PROFILE_DEFAULT,
     refresh_cache: bool = False,
     download_workers: int = 1,
     analysis_workers: int = 1,
     delete_audio_after_analysis: bool = True,
     progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
+    resource_settings = _resolve_analysis_resource_settings(
+        download_workers=download_workers,
+        analysis_workers=analysis_workers,
+        resource_profile=resource_profile,
+    )
+    resource_profile = str(resource_settings['resource_profile'])
+    download_workers = int(resource_settings['download_workers'])
+    analysis_workers = int(resource_settings['analysis_workers'])
+    force_process_pool = bool(resource_settings['force_process_pool'])
+    _prepare_background_worker_environment(resource_profile)
+    if resource_profile == _RESOURCE_PROFILE_BACKGROUND:
+        logger.info(
+            'Background audio analysis enabled: using %d download worker and %d low-priority analysis worker.',
+            download_workers,
+            analysis_workers,
+        )
+
     registry_rows = []
     feature_cache_df, feature_cache_csv_path = _load_feature_cache_table(feature_cache_dir)
     feature_cache_lookup = _build_feature_cache_lookup(feature_cache_df)
@@ -1254,7 +1393,13 @@ def analyze_youtube_playlist_audio(
         if _row_has_audio_features(row, flow_profile=flow_profile):
             logger.debug('using existing dataframe features for %s', normalized_video_id)
             reused_from_df += 1
-            _emit_progress(progress_callback, 'Scanning audio cache', row_number, max(total, 1), f'{normalized_video_id} existing dataframe features')
+            _emit_progress(
+                progress_callback,
+                'Scanning audio cache',
+                row_number,
+                max(total, 1),
+                f'{_task_progress_detail(normalized_video_id, _metadata_from_row(row, url_col=url_col))} existing dataframe features',
+            )
             continue
         if not refresh_cache:
             cached_features = _lookup_feature_cache_row(
@@ -1269,7 +1414,13 @@ def analyze_youtube_playlist_audio(
                 cached_features[id_col] = video_id
                 registry_rows.append(cached_features)
                 reused_from_cache += 1
-                _emit_progress(progress_callback, 'Scanning audio cache', row_number, max(total, 1), f'{normalized_video_id} audio cache hit')
+                _emit_progress(
+                    progress_callback,
+                    'Scanning audio cache',
+                    row_number,
+                    max(total, 1),
+                    f'{_task_progress_detail(normalized_video_id, _metadata_from_row(row, url_col=url_col))} audio cache hit',
+                )
                 continue
         url = str(row.get(url_col) or f'https://www.youtube.com/watch?v={video_id}')
         metadata = _metadata_from_row(row, url_col=url_col)
@@ -1284,7 +1435,13 @@ def analyze_youtube_playlist_audio(
             task['metadata'] = _merge_metadata_dicts(task.get('metadata'), metadata)
             if not str(task.get('url') or '').strip():
                 task['url'] = url
-        _emit_progress(progress_callback, 'Scanning audio cache', row_number, max(total, 1), f'{normalized_video_id} queued for analysis')
+        _emit_progress(
+            progress_callback,
+            'Scanning audio cache',
+            row_number,
+            max(total, 1),
+            f'{_task_progress_detail(normalized_video_id, metadata)} queued for analysis',
+        )
 
     pending_list = list(pending_tasks.values())
     downloaded_audio_paths: dict[str, str] = {}
@@ -1306,12 +1463,15 @@ def analyze_youtube_playlist_audio(
                 except Exception as exc:
                     skipped += 1
                     logger.warning('skipping %s due to audio download error: %r', video_id, exc)
+                    progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} download failed'
+                else:
+                    progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} downloaded'
                 _emit_progress(
                     progress_callback,
                     'Downloading audio',
                     task_number,
                     total_pending,
-                    _task_display_label(video_id, task.get('metadata')),
+                    progress_detail,
                 )
         else:
             future_map = {}
@@ -1335,12 +1495,15 @@ def analyze_youtube_playlist_audio(
                     except Exception as exc:
                         skipped += 1
                         logger.warning('skipping %s due to audio download error: %r', video_id, exc)
+                        progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} download failed'
+                    else:
+                        progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} downloaded'
                     _emit_progress(
                         progress_callback,
                         'Downloading audio',
                         completed,
                         total_pending,
-                        _task_display_label(video_id, task.get('metadata')),
+                        progress_detail,
                     )
 
     analyzed_records: list[dict] = []
@@ -1356,7 +1519,7 @@ def analyze_youtube_playlist_audio(
             max(total_analyzable, 1),
             f'starting {total_analyzable} tracks with {max_analysis_workers} workers',
         )
-        if max_analysis_workers == 1:
+        if max_analysis_workers == 1 and not force_process_pool:
             for task_number, task in enumerate(analyzable_tasks, start=1):
                 video_id = str(task['video_id'])
                 try:
@@ -1370,22 +1533,28 @@ def analyze_youtube_playlist_audio(
                     skipped += 1
                     failed_analysis_video_ids.add(video_id)
                     logger.warning('skipping %s due to audio analysis error: %r', video_id, exc)
+                    progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analysis failed'
                 else:
                     analyzed_records.append({
                         'video_id': video_id,
                         'metadata': dict(task.get('metadata') or {}),
                         'features': feats,
                     })
+                    progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analyzed'
                 _emit_progress(
                     progress_callback,
                     'Analyzing audio',
                     task_number,
                     total_analyzable,
-                    _task_display_label(video_id, task.get('metadata')),
+                    progress_detail,
                 )
         else:
             future_map = {}
-            with ProcessPoolExecutor(max_workers=max_analysis_workers) as executor:
+            with ProcessPoolExecutor(
+                max_workers=max_analysis_workers,
+                initializer=_initialize_analysis_worker,
+                initargs=(resource_profile,),
+            ) as executor:
                 for task in analyzable_tasks:
                     video_id = str(task['video_id'])
                     future = executor.submit(
@@ -1407,18 +1576,20 @@ def analyze_youtube_playlist_audio(
                         skipped += 1
                         failed_analysis_video_ids.add(video_id)
                         logger.warning('skipping %s due to audio analysis error: %r', video_id, exc)
+                        progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analysis failed'
                     else:
                         analyzed_records.append({
                             'video_id': video_id,
                             'metadata': dict(task.get('metadata') or {}),
                             'features': feats,
                         })
+                        progress_detail = f'{_task_progress_detail(video_id, task.get("metadata"))} analyzed'
                     _emit_progress(
                         progress_callback,
                         'Analyzing audio',
                         completed,
                         total_analyzable,
-                        _task_display_label(video_id, task.get('metadata')),
+                        progress_detail,
                     )
 
     if delete_audio_after_analysis and failed_analysis_video_ids:
@@ -1506,7 +1677,7 @@ def build_audio_cache_parser(config: dict, config_path: str, no_config: bool) ->
     parser.add_argument('--config', default=config_path, help='Path to project TOML config')
     parser.add_argument('--no-config', action='store_true', default=no_config, help='Ignore the TOML config and use CLI/default values only')
     parser.add_argument('--audio-cache', default=get_config_value(config, 'cache.audio_dir', 'data/audio_cache'), help='Directory containing downloaded audio files to analyze')
-    parser.add_argument('--feature-cache', default=os.path.join(get_config_value(config, 'cache.root_dir', 'data/cache'), 'audio_features.csv'), help='Global audio feature cache CSV')
+    parser.add_argument('--feature-cache', default=os.path.join(get_config_value(config, 'cache.root_dir', 'data/cache'), 'audio_features.sqlite'), help='Global audio feature cache SQLite DB')
     _add_bool_override(
         parser,
         true_flag='--refresh-cache',
@@ -1519,6 +1690,7 @@ def build_audio_cache_parser(config: dict, config_path: str, no_config: bool) ->
     parser.add_argument('--edge-seconds', type=float, default=float(get_config_value(config, 'analysis.edge_seconds', 30.0)), help='Analyze first/last non-silent seconds')
     parser.add_argument('--silence-top-db', type=float, default=float(get_config_value(config, 'analysis.silence_top_db', 35.0)), help='Silence threshold for trimming (higher trims more)')
     parser.add_argument('--flow-profile', default=get_config_value(config, 'analysis.flow_profile', 'deep-dj'), choices=['standard', 'deep-dj'], help='Transition edge analysis depth')
+    parser.add_argument('--resource-profile', default=get_config_value(config, 'analysis.resource_profile', _RESOURCE_PROFILE_DEFAULT), choices=list(_RESOURCE_PROFILE_CHOICES), help='Resource usage profile: `background` throttles audio analysis so it can run more gently in the background')
     parser.add_argument('--analysis-workers', type=int, default=int(get_config_value(config, 'analysis.analysis_workers', 4)), help='Concurrent worker count for CPU-heavy audio feature extraction')
     _add_bool_override(
         parser,
@@ -1550,6 +1722,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             edge_seconds=args.edge_seconds,
             silence_top_db=args.silence_top_db,
             flow_profile=args.flow_profile,
+            resource_profile=args.resource_profile,
             refresh_cache=bool(args.refresh_cache),
             analysis_workers=int(args.analysis_workers),
             delete_audio_after_analysis=bool(args.delete_audio_after_analysis),

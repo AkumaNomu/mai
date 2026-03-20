@@ -157,6 +157,7 @@ def build_parser(config: dict, config_path: str, no_config: bool) -> argparse.Ar
     parser.add_argument('--edge-seconds', type=float, default=float(get_config_value(config, 'analysis.edge_seconds', 30.0)), help='Analyze first/last non-silent seconds')
     parser.add_argument('--silence-top-db', type=float, default=float(get_config_value(config, 'analysis.silence_top_db', 35.0)), help='Silence threshold for trimming (higher trims more)')
     parser.add_argument('--flow-profile', default=get_config_value(config, 'analysis.flow_profile', 'deep-dj'), choices=['standard', 'deep-dj'], help='Transition edge analysis depth')
+    parser.add_argument('--resource-profile', default=get_config_value(config, 'analysis.resource_profile', 'default'), choices=['default', 'background'], help='Resource usage profile: `background` throttles audio analysis so it can run more gently in the background')
     parser.add_argument('--download-workers', type=int, default=int(get_config_value(config, 'analysis.download_workers', 4)), help='Concurrent worker count for YouTube audio downloads')
     parser.add_argument('--analysis-workers', type=int, default=int(get_config_value(config, 'analysis.analysis_workers', 4)), help='Concurrent worker count for CPU-heavy audio feature extraction')
     _add_bool_override(
@@ -246,19 +247,21 @@ def main(argv: Sequence[str] | None = None):
             logger.info('Fetched %d tracks.', len(df))
             if not args.no_audio_analysis:
                 logger.info(
-                    'Analyzing audio (edge_seconds=%.1f, silence_top_db=%.1f, flow_profile=%s)...',
+                    'Analyzing audio (edge_seconds=%.1f, silence_top_db=%.1f, flow_profile=%s, resource_profile=%s)...',
                     args.edge_seconds,
                     args.silence_top_db,
                     args.flow_profile,
+                    args.resource_profile,
                 )
                 df = analyze_youtube_playlist_audio(
                     df,
                     audio_cache_dir=args.audio_cache,
-                    feature_cache_dir=os.path.join(args.cache_dir, 'audio_features.csv'),
+                    feature_cache_dir=os.path.join(args.cache_dir, 'audio_features.sqlite'),
                     max_tracks=args.max_tracks,
                     edge_seconds=args.edge_seconds,
                     silence_top_db=args.silence_top_db,
                     flow_profile=args.flow_profile,
+                    resource_profile=args.resource_profile,
                     refresh_cache=args.refresh_cache,
                     download_workers=args.download_workers,
                     analysis_workers=args.analysis_workers,

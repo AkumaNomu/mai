@@ -26,12 +26,36 @@ def sample_features(tempo: float = 120.0) -> dict:
 
 
 class AudioFeatureCacheTableTests(unittest.TestCase):
+    def test_background_resource_profile_caps_workers(self):
+        settings = audio_analysis._resolve_analysis_resource_settings(
+            download_workers=4,
+            analysis_workers=12,
+            resource_profile='background',
+        )
+
+        self.assertEqual(settings['resource_profile'], 'background')
+        self.assertEqual(settings['download_workers'], 1)
+        self.assertEqual(settings['analysis_workers'], 1)
+        self.assertTrue(settings['force_process_pool'])
+
+    def test_default_resource_profile_preserves_workers(self):
+        settings = audio_analysis._resolve_analysis_resource_settings(
+            download_workers=3,
+            analysis_workers=6,
+            resource_profile='default',
+        )
+
+        self.assertEqual(settings['resource_profile'], 'default')
+        self.assertEqual(settings['download_workers'], 3)
+        self.assertEqual(settings['analysis_workers'], 6)
+        self.assertFalse(settings['force_process_pool'])
+
     def test_upsert_and_lookup_feature_cache_row(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / 'audio_features.csv'
             cache_df, resolved_path = audio_analysis._load_feature_cache_table(str(csv_path))
 
-            self.assertEqual(resolved_path, str(csv_path))
+            self.assertEqual(resolved_path, str(csv_path.with_suffix('.sqlite')))
             cache_df = audio_analysis._upsert_feature_cache_row(
                 cache_df,
                 str(csv_path),
@@ -169,7 +193,7 @@ class AudioFeatureCacheTableTests(unittest.TestCase):
 
             loaded_df, resolved_path = audio_analysis._load_feature_cache_table(str(csv_path))
 
-            self.assertEqual(resolved_path, str(csv_path))
+            self.assertEqual(resolved_path, str(csv_path.with_suffix('.sqlite')))
             self.assertEqual(set(loaded_df['video_id']), {'video-1', 'video-2'})
             preserved = loaded_df.loc[loaded_df['video_id'] == 'video-1'].iloc[0]
             imported = loaded_df.loc[loaded_df['video_id'] == 'video-2'].iloc[0]
@@ -277,7 +301,7 @@ class AudioFeatureCacheIntegrationTests(unittest.TestCase):
             self.assertEqual(download_audio_mock.call_count, 1)
             self.assertEqual(float(third_result.loc[0, 'tempo']), 130.0)
 
-            cache_df = audio_analysis._read_feature_cache_table(str(csv_path))
+            cache_df = audio_analysis._read_feature_cache_table(str(csv_path.with_suffix('.sqlite')))
             self.assertEqual(len(cache_df), 2)
             self.assertEqual(sorted(cache_df['video_id'].tolist()), ['video-1', 'video-1'])
             self.assertIn('analysis_signature', cache_df.columns)
@@ -337,6 +361,18 @@ class AudioFeatureCacheIntegrationTests(unittest.TestCase):
         self.assertIn(('Scanning audio cache', 0, 1, 'checking 1 tracks'), events)
         self.assertIn(('Downloading audio', 0, 1, 'starting 1 downloads with 1 workers'), events)
         self.assertIn(('Analyzing audio', 0, 1, 'starting 1 tracks with 1 workers'), events)
+        self.assertIn(
+            ('Scanning audio cache', 1, 1, 'video-1 | Artist 1 - Track 1 queued for analysis'),
+            events,
+        )
+        self.assertIn(
+            ('Downloading audio', 1, 1, 'video-1 | Artist 1 - Track 1 downloaded'),
+            events,
+        )
+        self.assertIn(
+            ('Analyzing audio', 1, 1, 'video-1 | Artist 1 - Track 1 analyzed'),
+            events,
+        )
 
     @patch('mai.audio_analysis.analyze_audio_file')
     @patch('mai.audio_analysis.download_youtube_audio')
@@ -453,9 +489,9 @@ class AudioFeatureCacheIntegrationTests(unittest.TestCase):
             download_audio_mock.assert_not_called()
             self.assertEqual(float(result.loc[0, 'tempo']), 140.0)
 
-            csv_path = Path(f'{legacy_dir}.csv')
-            self.assertTrue(csv_path.exists())
-            cache_df = audio_analysis._read_feature_cache_table(str(csv_path))
+            sqlite_path = Path(f'{legacy_dir}.sqlite')
+            self.assertTrue(sqlite_path.exists())
+            cache_df = audio_analysis._read_feature_cache_table(str(sqlite_path))
             self.assertEqual(len(cache_df), 1)
             self.assertEqual(cache_df.iloc[0]['video_id'], 'video-1')
             self.assertEqual(float(cache_df.iloc[0]['tempo']), 140.0)
@@ -490,7 +526,7 @@ class AudioFeatureCacheIntegrationTests(unittest.TestCase):
             self.assertEqual(result_df.loc[0, 'analysis_status'], 'analyzed')
             self.assertEqual(float(result_df.loc[0, 'tempo']), 123.0)
 
-            cache_df = audio_analysis._read_feature_cache_table(str(csv_path))
+            cache_df = audio_analysis._read_feature_cache_table(str(csv_path.with_suffix('.sqlite')))
             self.assertEqual(len(cache_df), 1)
             self.assertEqual(cache_df.iloc[0]['video_id'], 'video-1')
             self.assertEqual(float(cache_df.iloc[0]['tempo']), 123.0)

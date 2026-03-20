@@ -14,6 +14,13 @@ class RunTitleTests(unittest.TestCase):
 
         self.assertEqual(title, 'Custom Export')
 
+    def test_build_parser_accepts_background_resource_profile(self):
+        parser = run.build_parser({}, config_path='mai.toml', no_config=True)
+
+        args = parser.parse_args(['--csv', 'playlist.csv', '--resource-profile', 'background'])
+
+        self.assertEqual(args.resource_profile, 'background')
+
 
 if __name__ == '__main__':
     unittest.main()

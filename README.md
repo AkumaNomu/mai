@@ -58,6 +58,7 @@ Training sources are configured by repeating `[[training.channels]]` blocks in `
 The default audio-analysis parallelism is:
 - `analysis.download_workers = 4`
 - `analysis.analysis_workers = 4`
+- `analysis.resource_profile = "default"` or `"background"` for gentler background analysis
 
 The balanced scraper defaults are:
 - `training.max_search_results = 5`
@@ -91,10 +92,11 @@ python run.py --youtube-playlist <PLAYLIST_URL_OR_ID> --no-audio-analysis
 
 Audio analysis uses `yt-dlp` + `librosa`. On Windows, Mai will try to auto-download `ffmpeg` and `ffprobe` into `data/tools/ffmpeg` if they are missing.
 When there are uncached tracks, Mai now parallelizes YouTube audio downloads and local feature extraction while keeping cache writes centralized.
+Use `--resource-profile background` when you want audio analysis to back off and run more gently in the background.
 
 Mai now reuses cached data by default:
 - playlist metadata cache in `data/cache/youtube_playlists`
-- extracted feature cache in `data/cache/audio_features.csv`
+- extracted feature cache in `data/cache/audio_features.sqlite`
 - downloaded audio cache in `data/audio_cache`
 
 Use `--refresh-cache` when you want to ignore those caches and rebuild from scratch.
@@ -105,7 +107,7 @@ python -m mai.cache_cleanup --dry-run
 python -m mai.cache_cleanup
 ```
 
-To analyze audio files that are already sitting in `data/audio_cache` and delete each file right after its features are saved into the global CSV, run:
+To analyze audio files that are already sitting in `data/audio_cache` and delete each file right after its features are saved into the global SQLite cache, run:
 
 ```powershell
 python -m mai.audio_analysis

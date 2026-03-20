@@ -38,9 +38,20 @@ NOTE_STYLES = {
     'warning': (FG_YELLOW, 'WARN '),
     'error': (FG_RED, 'FAIL '),
     'section': (FG_MAGENTA, 'STEP '),
+    'track': (FG_BLUE, 'TRACK'),
 }
 BAR_COLORS = [FG_CYAN, FG_BLUE, FG_MAGENTA, FG_GREEN, FG_BRIGHT_CYAN]
 HEARTBEAT_FRAMES = ('-', '\\', '|', '/')
+TRACK_PROGRESS_LABELS = {
+    'Scanning audio cache',
+    'Downloading audio',
+    'Analyzing audio',
+    'Scanning local audio cache',
+    'Checking feature cache',
+    'Analyzing local audio cache',
+}
+TRACK_PROGRESS_IGNORED_PREFIXES = ('checking ', 'starting ')
+TRACK_PROGRESS_IGNORED_SUFFIXES = (' temp file skipped', ' missing video id')
 
 
 def _enable_windows_vt_mode() -> None:
@@ -108,6 +119,7 @@ class CliProgressRenderer:
     _last_progress_event_at: float = field(default=0.0, init=False)
     _last_heartbeat_at: float = field(default=0.0, init=False)
     _heartbeat_index: int = field(default=0, init=False)
+    _seen_track_updates: set[str] = field(default_factory=set, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _heartbeat_thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -164,8 +176,16 @@ class CliProgressRenderer:
             self._last_progress_event_at = now
 
             if self.is_tty:
-                if self._active_label is not None and self._active_label != label:
+                track_note = self._consume_track_progress_detail(label, detail)
+                has_active_progress_line = self._active_label is not None
+                if has_active_progress_line and self._active_label != label:
                     print(file=self.stream, flush=True)
+                    self._last_render_length = 0
+                    has_active_progress_line = False
+                if track_note:
+                    if has_active_progress_line:
+                        print(file=self.stream, flush=True)
+                    print(self._format_note(track_note, tone='track'), file=self.stream, flush=True)
                     self._last_render_length = 0
                 message = self._format_progress_message(label, current, total, detail, elapsed_seconds=now - self._progress_started_at)
                 padding = ' ' * max(self._last_render_length - _visible_len(message), 0)
@@ -231,6 +251,22 @@ class CliProgressRenderer:
     def _bar_color(self, label: str) -> str:
         index = sum(ord(char) for char in str(label)) % len(BAR_COLORS)
         return BAR_COLORS[index]
+
+    def _consume_track_progress_detail(self, label: str, detail: str) -> str:
+        if label not in TRACK_PROGRESS_LABELS:
+            return ''
+        normalized_detail = str(detail or '').strip()
+        if not normalized_detail:
+            return ''
+        folded_detail = normalized_detail.casefold()
+        if any(folded_detail.startswith(prefix) for prefix in TRACK_PROGRESS_IGNORED_PREFIXES):
+            return ''
+        if any(folded_detail.endswith(suffix) for suffix in TRACK_PROGRESS_IGNORED_SUFFIXES):
+            return ''
+        if normalized_detail in self._seen_track_updates:
+            return ''
+        self._seen_track_updates.add(normalized_detail)
+        return normalized_detail
 
     def _format_note(self, label: str, detail: str = '', tone: str = 'info') -> str:
         color, prefix = NOTE_STYLES.get(tone, NOTE_STYLES['info'])

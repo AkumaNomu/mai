@@ -16,12 +16,14 @@ def fake_analyze_youtube_playlist_audio(
     edge_seconds=30.0,
     silence_top_db=35.0,
     flow_profile='deep-dj',
+    resource_profile='default',
     refresh_cache=False,
     download_workers=1,
     analysis_workers=1,
     delete_audio_after_analysis=True,
     progress_callback=None,
 ):
+    del resource_profile
     rows = []
     for _, row in df.iterrows():
         rows.append({
@@ -1110,8 +1112,18 @@ class TrainingScrapeIntegrationTests(unittest.TestCase):
             )
             self.assertGreater(len(FakeYoutubeDL.calls), 0)
             training_cache_root = Path(tmpdir) / 'training'
-            source_cache_df = pd.read_csv(training_cache_root / 'source_tracks.csv')
-            resolution_cache_df = pd.read_csv(training_cache_root / 'track_resolutions.csv')
+            source_cache_path = training_cache_root / 'source_tracks.sqlite'
+            resolution_cache_path = training_cache_root / 'track_resolutions.sqlite'
+            self.assertTrue(source_cache_path.exists())
+            self.assertTrue(resolution_cache_path.exists())
+            source_cache_df = training_scrape._read_cache_table(
+                str(source_cache_path),
+                training_scrape.SOURCE_TRACK_CACHE_COLUMNS,
+            )
+            resolution_cache_df = training_scrape._read_cache_table(
+                str(resolution_cache_path),
+                training_scrape.RESOLUTION_CACHE_COLUMNS,
+            )
             self.assertIn('source_signature', source_cache_df.columns)
             self.assertNotIn('channel_url', source_cache_df.columns)
             self.assertNotIn('video_url', source_cache_df.columns)

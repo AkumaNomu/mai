@@ -17,6 +17,7 @@ from yt_dlp import YoutubeDL
 from .audio_analysis import analyze_youtube_playlist_audio
 from .cli_progress import CliProgressRenderer, configure_cli_logging
 from .config import DEFAULT_CONFIG_PATH, get_config_value, load_project_config
+from .tabular_cache import read_sqlite_table, resolve_sqlite_cache_path, write_sqlite_table
 from .yt_dlp_auth import apply_yt_dlp_auth_options
 
 
@@ -881,11 +882,11 @@ def _search_cache_path(cache_dir: str, normalized_query: str, max_results: int) 
 
 
 def _source_track_cache_path(cache_dir: str) -> str:
-    return os.path.join(_training_cache_root(cache_dir), 'source_tracks.csv')
+    return os.path.join(_training_cache_root(cache_dir), 'source_tracks.sqlite')
 
 
 def _resolution_cache_path(cache_dir: str) -> str:
-    return os.path.join(_training_cache_root(cache_dir), 'track_resolutions.csv')
+    return os.path.join(_training_cache_root(cache_dir), 'track_resolutions.sqlite')
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -920,7 +921,19 @@ def _read_json(path: str) -> Optional[dict[str, Any]]:
 
 
 def _read_cache_table(path: str, columns: list[str]) -> pd.DataFrame:
-    if not path or not os.path.exists(path):
+    if not path:
+        return pd.DataFrame(columns=columns)
+    if str(path).lower().endswith(('.sqlite', '.db')):
+        sqlite_path, legacy_csv_path = resolve_sqlite_cache_path(path, default_path=path)
+        if os.path.exists(sqlite_path):
+            df = read_sqlite_table(sqlite_path, columns=columns)
+            if df.empty:
+                return pd.DataFrame(columns=columns)
+            return df
+        if legacy_csv_path and os.path.exists(legacy_csv_path):
+            return _read_cache_table(legacy_csv_path, columns)
+        return pd.DataFrame(columns=columns)
+    if not os.path.exists(path):
         return pd.DataFrame(columns=columns)
     try:
         df = pd.read_csv(path, low_memory=False)
@@ -933,11 +946,19 @@ def _read_cache_table(path: str, columns: list[str]) -> pd.DataFrame:
     return df.reindex(columns=ordered_columns)
 
 
-def _write_cache_table(path: str, df: pd.DataFrame, columns: list[str]) -> None:
-    _ensure_parent_dir(path)
+def _write_cache_table(path: str, df: pd.DataFrame, columns: list[str], *, key_columns: Optional[list[str]] = None) -> None:
     ordered_columns = [column for column in columns if column in df.columns]
     ordered_columns.extend(sorted(column for column in df.columns if column not in ordered_columns))
     prepared = df.reindex(columns=ordered_columns) if ordered_columns else df.copy()
+    if str(path).lower().endswith(('.sqlite', '.db')):
+        write_sqlite_table(
+            path,
+            prepared,
+            columns=prepared.columns.tolist() or columns,
+            key_columns=key_columns or [],
+        )
+        return
+    _ensure_parent_dir(path)
     directory = os.path.dirname(path) or '.'
     fd, temp_path = tempfile.mkstemp(prefix='mai_cache_', suffix='.tmp', dir=directory)
     os.close(fd)
@@ -967,22 +988,36 @@ def compact_training_cache(cache_dir: str = 'data/cache') -> dict[str, int]:
         return summary
 
     source_track_cache_path = _source_track_cache_path(cache_dir)
-    if os.path.exists(source_track_cache_path):
-        summary['bytes_before'] += int(os.path.getsize(source_track_cache_path))
+    source_track_sqlite_path, source_track_legacy_csv_path = resolve_sqlite_cache_path(source_track_cache_path, default_path=source_track_cache_path)
+    if os.path.exists(source_track_sqlite_path) or os.path.exists(source_track_legacy_csv_path):
+        bytes_before_path = source_track_sqlite_path if os.path.exists(source_track_sqlite_path) else source_track_legacy_csv_path
+        summary['bytes_before'] += int(os.path.getsize(bytes_before_path))
         source_track_cache_df = _compact_source_track_cache_rows(
             _read_cache_table(source_track_cache_path, SOURCE_TRACK_CACHE_COLUMNS)
         )
-        _write_cache_table(source_track_cache_path, source_track_cache_df, SOURCE_TRACK_CACHE_COLUMNS)
+        _write_cache_table(
+            source_track_cache_path,
+            source_track_cache_df,
+            SOURCE_TRACK_CACHE_COLUMNS,
+            key_columns=['video_id', 'position'],
+        )
         summary['bytes_after'] += int(os.path.getsize(source_track_cache_path))
         summary['source_track_rows'] = int(len(source_track_cache_df))
 
     resolution_cache_path = _resolution_cache_path(cache_dir)
-    if os.path.exists(resolution_cache_path):
-        summary['bytes_before'] += int(os.path.getsize(resolution_cache_path))
+    resolution_sqlite_path, resolution_legacy_csv_path = resolve_sqlite_cache_path(resolution_cache_path, default_path=resolution_cache_path)
+    if os.path.exists(resolution_sqlite_path) or os.path.exists(resolution_legacy_csv_path):
+        bytes_before_path = resolution_sqlite_path if os.path.exists(resolution_sqlite_path) else resolution_legacy_csv_path
+        summary['bytes_before'] += int(os.path.getsize(bytes_before_path))
         resolution_cache_df = _compact_resolution_cache_rows(
             _read_cache_table(resolution_cache_path, RESOLUTION_CACHE_COLUMNS)
         )
-        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_CACHE_COLUMNS)
+        _write_cache_table(
+            resolution_cache_path,
+            resolution_cache_df,
+            RESOLUTION_CACHE_COLUMNS,
+            key_columns=['video_id', 'position'],
+        )
         summary['bytes_after'] += int(os.path.getsize(resolution_cache_path))
         summary['resolution_rows'] = int(len(resolution_cache_df))
 
@@ -1874,7 +1909,12 @@ def scrape_channel_track_rows(
     if cache_dir and cache_updates:
         for source_video_id, rows_df in cache_updates:
             source_track_cache_df = _replace_source_track_rows(source_track_cache_df, source_video_id, rows_df)
-        _write_cache_table(source_track_cache_path, source_track_cache_df, SOURCE_TRACK_CACHE_COLUMNS)
+        _write_cache_table(
+            source_track_cache_path,
+            source_track_cache_df,
+            SOURCE_TRACK_CACHE_COLUMNS,
+            key_columns=['video_id', 'position'],
+        )
 
     return source_tracks_dataframe(track_rows), summary
 
@@ -2154,7 +2194,12 @@ def resolve_scraped_tracks(
             resolution_cache_df,
             resolution_dataframe(new_resolution_rows),
         )
-        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_CACHE_COLUMNS)
+        _write_cache_table(
+            resolution_cache_path,
+            resolution_cache_df,
+            RESOLUTION_CACHE_COLUMNS,
+            key_columns=['video_id', 'position'],
+        )
 
     return scraped_tracks_dataframe(rows), summary
 
@@ -2170,6 +2215,7 @@ def analyze_resolved_tracks(
     edge_seconds: float = 30.0,
     silence_top_db: float = 35.0,
     flow_profile: str = 'deep-dj',
+    resource_profile: str = 'default',
     refresh_cache: bool = False,
     delete_audio_after_analysis: bool = True,
     progress_callback: ProgressCallback | None = None,
@@ -2221,6 +2267,7 @@ def analyze_resolved_tracks(
         edge_seconds=edge_seconds,
         silence_top_db=silence_top_db,
         flow_profile=flow_profile,
+        resource_profile=resource_profile,
         refresh_cache=refresh_cache,
         download_workers=download_workers,
         analysis_workers=analysis_workers,
@@ -2249,7 +2296,12 @@ def analyze_resolved_tracks(
     if cache_dir:
         updated_rows_df = resolution_dataframe(merged.reindex(columns=RESOLUTION_COLUMNS).to_dict(orient='records'))
         resolution_cache_df = _upsert_resolution_rows(resolution_cache_df, updated_rows_df)
-        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_CACHE_COLUMNS)
+        _write_cache_table(
+            resolution_cache_path,
+            resolution_cache_df,
+            RESOLUTION_CACHE_COLUMNS,
+            key_columns=['video_id', 'position'],
+        )
 
     tracks_with_features = int(merged.apply(lambda row: _track_row_has_analysis(row, flow_profile=flow_profile), axis=1).sum())
     tracks_analysis_failed = int(failure_mask.sum())
@@ -2398,6 +2450,7 @@ def scrape_training_transitions(
     edge_seconds: float = 30.0,
     silence_top_db: float = 35.0,
     flow_profile: str = 'deep-dj',
+    resource_profile: str = 'default',
     refresh_cache: bool = False,
     delete_audio_after_analysis: bool = True,
     progress_callback: ProgressCallback | None = None,
@@ -2490,6 +2543,7 @@ def scrape_training_transitions(
         edge_seconds=edge_seconds,
         silence_top_db=silence_top_db,
         flow_profile=flow_profile,
+        resource_profile=resource_profile,
         refresh_cache=refresh_cache,
         delete_audio_after_analysis=delete_audio_after_analysis,
         progress_callback=progress_callback,
@@ -2519,6 +2573,7 @@ def scrape_channel_training_transitions(
     edge_seconds: float = 30.0,
     silence_top_db: float = 35.0,
     flow_profile: str = 'deep-dj',
+    resource_profile: str = 'default',
     refresh_cache: bool = False,
     delete_audio_after_analysis: bool = True,
     progress_callback: ProgressCallback | None = None,
@@ -2537,6 +2592,7 @@ def scrape_channel_training_transitions(
         edge_seconds=edge_seconds,
         silence_top_db=silence_top_db,
         flow_profile=flow_profile,
+        resource_profile=resource_profile,
         refresh_cache=refresh_cache,
         delete_audio_after_analysis=delete_audio_after_analysis,
         progress_callback=progress_callback,
@@ -2579,6 +2635,7 @@ def build_parser(config: dict, config_path: str, no_config: bool) -> argparse.Ar
     parser.add_argument('--edge-seconds', type=float, default=float(get_config_value(config, 'analysis.edge_seconds', 30.0)), help='Analyze first/last non-silent seconds')
     parser.add_argument('--silence-top-db', type=float, default=float(get_config_value(config, 'analysis.silence_top_db', 35.0)), help='Silence threshold for trimming (higher trims more)')
     parser.add_argument('--flow-profile', default=get_config_value(config, 'analysis.flow_profile', 'deep-dj'), choices=['standard', 'deep-dj'], help='Transition edge analysis depth')
+    parser.add_argument('--resource-profile', default=get_config_value(config, 'analysis.resource_profile', 'default'), choices=['default', 'background'], help='Resource usage profile: `background` throttles audio analysis so it can run more gently in the background')
     parser.add_argument('--download-workers', type=int, default=int(get_config_value(config, 'analysis.download_workers', 4)), help='Concurrent worker count for YouTube audio downloads')
     parser.add_argument('--analysis-workers', type=int, default=int(get_config_value(config, 'analysis.analysis_workers', 4)), help='Concurrent worker count for CPU-heavy audio feature extraction')
     _add_bool_override(
@@ -2612,7 +2669,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             channels=channels,
             cache_dir=args.cache_dir,
             audio_cache_dir=args.audio_cache,
-            feature_cache_dir=os.path.join(args.cache_dir, 'audio_features.csv'),
+            feature_cache_dir=os.path.join(args.cache_dir, 'audio_features.sqlite'),
             max_videos=args.max_videos,
             max_search_results=args.max_search_results,
             metadata_workers=args.metadata_workers,
@@ -2622,6 +2679,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             edge_seconds=args.edge_seconds,
             silence_top_db=args.silence_top_db,
             flow_profile=args.flow_profile,
+            resource_profile=args.resource_profile,
             refresh_cache=args.refresh_cache,
             delete_audio_after_analysis=args.delete_audio_after_analysis,
             progress_callback=progress.update,

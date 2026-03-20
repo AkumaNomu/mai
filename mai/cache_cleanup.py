@@ -86,7 +86,7 @@ def clean_useless_cache(
 ) -> dict[str, int]:
     cache_root = Path(str(cache_dir)).resolve()
     audio_root = Path(str(audio_cache_dir)).resolve()
-    feature_cache_df, feature_cache_csv_path = _load_feature_cache_table(feature_cache_dir or str(cache_root / 'audio_features.csv'))
+    feature_cache_df, feature_cache_csv_path = _load_feature_cache_table(feature_cache_dir or str(cache_root / 'audio_features.sqlite'))
     feature_video_ids = {
         str(video_id).strip()
         for video_id in feature_cache_df.get('video_id', [])
@@ -145,7 +145,7 @@ def build_parser(config: dict[str, Any], config_path: str, no_config: bool) -> a
     parser.add_argument('--no-config', action='store_true', default=no_config, help='Ignore the TOML config and use CLI/default values only')
     parser.add_argument('--cache-dir', default=get_config_value(config, 'cache.root_dir', 'data/cache'), help='Directory for reusable metadata caches')
     parser.add_argument('--audio-cache', default=get_config_value(config, 'cache.audio_dir', 'data/audio_cache'), help='Directory for downloaded audio files')
-    parser.add_argument('--feature-cache', default=os.path.join(get_config_value(config, 'cache.root_dir', 'data/cache'), 'audio_features.csv'), help='Global audio feature cache CSV')
+    parser.add_argument('--feature-cache', default=os.path.join(get_config_value(config, 'cache.root_dir', 'data/cache'), 'audio_features.sqlite'), help='Global audio feature cache SQLite DB')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be removed without deleting files')
     parser.add_argument('--log-level', default=get_config_value(config, 'logging.level', 'INFO'), choices=['ERROR', 'WARNING', 'INFO', 'DEBUG'], help='Verbosity')
     return parser
