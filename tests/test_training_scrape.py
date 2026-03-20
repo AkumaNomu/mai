@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -1108,6 +1109,48 @@ class TrainingScrapeIntegrationTests(unittest.TestCase):
                 feature_cache_dir=str(Path(tmpdir) / 'audio_features.csv'),
             )
             self.assertGreater(len(FakeYoutubeDL.calls), 0)
+            training_cache_root = Path(tmpdir) / 'training'
+            source_cache_df = pd.read_csv(training_cache_root / 'source_tracks.csv')
+            resolution_cache_df = pd.read_csv(training_cache_root / 'track_resolutions.csv')
+            self.assertIn('source_signature', source_cache_df.columns)
+            self.assertNotIn('channel_url', source_cache_df.columns)
+            self.assertNotIn('video_url', source_cache_df.columns)
+            self.assertNotIn('label', source_cache_df.columns)
+            self.assertIn('resolution_signature', resolution_cache_df.columns)
+            self.assertNotIn('search_query', resolution_cache_df.columns)
+            self.assertNotIn('normalized_search_query', resolution_cache_df.columns)
+            self.assertNotIn('resolved_url', resolution_cache_df.columns)
+
+            channel_cache_path = next((training_cache_root / 'channel_videos').glob('*.json'))
+            channel_payload = json.loads(channel_cache_path.read_text(encoding='utf-8'))
+            self.assertEqual(list(channel_payload.keys()), ['entries'])
+            self.assertTrue(set(channel_payload['entries'][0].keys()) <= {'id', 'title'})
+
+            search_cache_path = next((training_cache_root / 'search_results').glob('*.json'))
+            search_payload = json.loads(search_cache_path.read_text(encoding='utf-8'))
+            self.assertEqual(list(search_payload.keys()), ['entries'])
+            self.assertTrue(set(search_payload['entries'][0].keys()) <= {'id', 'title', 'uploader', 'channel', 'duration', 'availability'})
+
+            metadata_cache_path = next((training_cache_root / 'video_metadata').glob('*.json'))
+            metadata_payload = json.loads(metadata_cache_path.read_text(encoding='utf-8'))
+            self.assertNotIn('formats', metadata_payload)
+            self.assertNotIn('thumbnails', metadata_payload)
+            self.assertTrue(set(metadata_payload.keys()) <= {
+                'title',
+                'description',
+                'uploader_id',
+                'channel_id',
+                'artist',
+                'uploader',
+                'channel',
+                'tags',
+                'categories',
+                'chapters',
+                'music_tracks',
+                'tracks',
+                'tracklist',
+                'music_sections',
+            })
 
             FakeYoutubeDL.calls = []
             training_scrape.scrape_training_transitions(

@@ -578,6 +578,294 @@ def _hash_text(value: str) -> str:
     return hashlib.sha1(str(value).encode('utf-8')).hexdigest()
 
 
+def _source_track_signature(
+    channel_url: str,
+    label: str,
+    label_source: str,
+    *,
+    cache_version: int = SOURCE_TRACK_CACHE_VERSION,
+) -> str:
+    payload = '||'.join([
+        str(cache_version),
+        str(channel_url),
+        str(label),
+        str(label_source),
+    ])
+    return f'v{int(cache_version)}|{_hash_text(payload)[:16]}'
+
+
+def _source_track_signature_from_row(row: pd.Series | dict[str, Any]) -> str:
+    signature = str(row.get('source_signature') or '').strip()
+    if signature:
+        return signature
+    try:
+        cache_version = int(float(row.get('source_cache_version')))
+    except (TypeError, ValueError):
+        cache_version = int(SOURCE_TRACK_CACHE_VERSION)
+    return _source_track_signature(
+        str(row.get('channel_url') or ''),
+        str(row.get('label') or ''),
+        str(row.get('label_source') or ''),
+        cache_version=cache_version,
+    )
+
+
+def _resolution_signature(
+    normalized_query: str,
+    max_results: int,
+    *,
+    cache_version: int = RESOLUTION_CACHE_VERSION,
+) -> str:
+    payload = '||'.join([
+        str(cache_version),
+        str(max(1, int(max_results))),
+        str(normalized_query or ''),
+    ])
+    return f'v{int(cache_version)}|{_hash_text(payload)[:16]}'
+
+
+def _resolution_signature_from_row(row: pd.Series | dict[str, Any]) -> str:
+    signature = str(row.get('resolution_signature') or '').strip()
+    if signature:
+        return signature
+    normalized_query = str(row.get('normalized_search_query') or '').strip()
+    if not normalized_query:
+        normalized_query = _normalize_search_query(str(row.get('search_query') or ''))
+    try:
+        max_results = int(float(row.get('search_max_results')))
+    except (TypeError, ValueError):
+        max_results = int(MAX_SEARCH_RESULTS)
+    try:
+        cache_version = int(float(row.get('resolution_cache_version')))
+    except (TypeError, ValueError):
+        cache_version = int(RESOLUTION_CACHE_VERSION)
+    return _resolution_signature(
+        normalized_query=normalized_query,
+        max_results=max_results,
+        cache_version=cache_version,
+    )
+
+
+def _compact_channel_video_entries(entries: Sequence[Any]) -> list[dict[str, str]]:
+    compacted: list[dict[str, str]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        video_id = str(entry.get('id') or '').strip()
+        if not video_id:
+            continue
+        compacted.append({
+            'id': video_id,
+            'title': str(entry.get('title') or '').strip(),
+        })
+    return compacted
+
+
+def _compact_search_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'id': str(candidate.get('id') or '').strip(),
+        'title': str(candidate.get('title') or '').strip(),
+        'uploader': str(candidate.get('uploader') or '').strip(),
+        'channel': str(candidate.get('channel') or '').strip(),
+        'duration': candidate.get('duration'),
+        'availability': str(candidate.get('availability') or '').strip(),
+    }
+
+
+def _compact_search_entries(entries: Sequence[Any]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        compacted.append(_compact_search_candidate(entry))
+    return compacted
+
+
+def _compact_metadata_artist_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = str(item.get('name') or item.get('title') or item.get('label') or '').strip()
+        else:
+            text = str(item or '').strip()
+        if text:
+            names.append(text)
+    return names
+
+
+def _compact_metadata_track_items(items: Any) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        compacted_item = {
+            'title': str(item.get('title') or '').strip(),
+            'track': str(item.get('track') or '').strip(),
+            'name': str(item.get('name') or '').strip(),
+            'song': str(item.get('song') or '').strip(),
+            'artist': str(item.get('artist') or '').strip(),
+            'artists': _compact_metadata_artist_list(item.get('artists')),
+            'start_time': item.get('start_time'),
+            'start_time_ms': item.get('start_time_ms'),
+            'timestamp': item.get('timestamp'),
+            'time_text': item.get('time_text'),
+        }
+        compacted.append({key: value for key, value in compacted_item.items() if value not in (None, '', [])})
+    return compacted
+
+
+def _compact_chapters(chapters: Any) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for chapter in chapters or []:
+        if not isinstance(chapter, dict):
+            continue
+        title = str(chapter.get('title') or '').strip()
+        start_time = chapter.get('start_time')
+        if start_time in (None, '') and not title:
+            continue
+        compacted.append({
+            key: value
+            for key, value in {
+                'title': title,
+                'start_time': start_time,
+            }.items()
+            if value not in (None, '')
+        })
+    return compacted
+
+
+def _compact_video_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    compacted = {
+        'title': str(metadata.get('title') or '').strip(),
+        'description': str(metadata.get('description') or '').strip(),
+        'uploader_id': str(metadata.get('uploader_id') or '').strip(),
+        'channel_id': str(metadata.get('channel_id') or '').strip(),
+        'artist': str(metadata.get('artist') or '').strip(),
+        'uploader': str(metadata.get('uploader') or '').strip(),
+        'channel': str(metadata.get('channel') or '').strip(),
+        'tags': [str(tag).strip() for tag in (metadata.get('tags') or []) if str(tag).strip()],
+        'categories': [str(category).strip() for category in (metadata.get('categories') or []) if str(category).strip()],
+        'chapters': _compact_chapters(metadata.get('chapters')),
+        'music_tracks': _compact_metadata_track_items(metadata.get('music_tracks')),
+        'tracks': _compact_metadata_track_items(metadata.get('tracks')),
+        'tracklist': _compact_metadata_track_items(metadata.get('tracklist')),
+        'music_sections': _compact_metadata_track_items(metadata.get('music_sections')),
+    }
+    category_text = _metadata_value_to_text(metadata.get('category'))
+    if category_text and not compacted['categories']:
+        compacted['categories'] = [category_text]
+    return {key: value for key, value in compacted.items() if value not in (None, '', [], {})}
+
+
+def _compact_source_track_cache_rows(rows_df: pd.DataFrame) -> pd.DataFrame:
+    if rows_df.empty:
+        return pd.DataFrame(columns=SOURCE_TRACK_CACHE_COLUMNS)
+    prepared = rows_df.copy()
+    if 'source_signature' not in prepared.columns:
+        prepared['source_signature'] = ''
+    missing_signature = prepared['source_signature'].fillna('').astype(str).str.strip().eq('')
+    if missing_signature.any():
+        prepared.loc[missing_signature, 'source_signature'] = prepared.loc[missing_signature].apply(
+            _source_track_signature_from_row,
+            axis=1,
+        )
+    if 'timestamp_s' not in prepared.columns and 'timestamp' in prepared.columns:
+        prepared['timestamp_s'] = prepared['timestamp'].map(timestamp_to_seconds)
+    if 'channel_handle' not in prepared.columns:
+        prepared['channel_handle'] = ''
+    if 'description_length' not in prepared.columns:
+        prepared['description_length'] = pd.NA
+    if 'track_source' not in prepared.columns:
+        prepared['track_source'] = ''
+    if 'chapter_title' not in prepared.columns:
+        prepared['chapter_title'] = ''
+    if 'chapter_timestamp_s' not in prepared.columns:
+        prepared['chapter_timestamp_s'] = pd.NA
+    if 'artist_guess' not in prepared.columns:
+        prepared['artist_guess'] = ''
+    if 'title_guess' not in prepared.columns:
+        prepared['title_guess'] = ''
+    compacted = prepared.reindex(columns=SOURCE_TRACK_CACHE_COLUMNS)
+    return compacted.sort_values(['video_id', 'position'], kind='stable').reset_index(drop=True)
+
+
+def _restore_source_track_cache_rows(
+    cached_rows_df: pd.DataFrame,
+    *,
+    channel_config: dict[str, str],
+    video: dict[str, str],
+) -> pd.DataFrame:
+    if cached_rows_df.empty:
+        return pd.DataFrame(columns=SOURCE_TRACK_COLUMNS)
+    compacted = _compact_source_track_cache_rows(cached_rows_df)
+    video_id = str(video.get('video_id') or '').strip()
+    video_title = str(video.get('video_title') or '').strip()
+    video_url = normalize_video_url(video_id, str(video.get('video_url') or '').strip())
+    restored = compacted.copy()
+    restored['channel_url'] = str(channel_config['url'])
+    restored['label'] = str(channel_config['label'])
+    restored['label_source'] = str(channel_config['label_source'])
+    restored['source_cache_version'] = int(SOURCE_TRACK_CACHE_VERSION)
+    restored['video_title'] = video_title
+    restored['video_url'] = video_url
+    restored['timestamp'] = restored['timestamp_s'].map(
+        lambda value: '' if pd.isna(value) or value == '' else _seconds_to_timestamp(int(value))
+    )
+    return restored.reindex(columns=SOURCE_TRACK_COLUMNS).sort_values(['video_id', 'position'], kind='stable').reset_index(drop=True)
+
+
+def _compact_resolution_cache_rows(rows_df: pd.DataFrame) -> pd.DataFrame:
+    if rows_df.empty:
+        return pd.DataFrame(columns=RESOLUTION_CACHE_COLUMNS)
+    prepared = rows_df.copy()
+    if 'resolution_signature' not in prepared.columns:
+        prepared['resolution_signature'] = ''
+    missing_signature = prepared['resolution_signature'].fillna('').astype(str).str.strip().eq('')
+    if missing_signature.any():
+        prepared.loc[missing_signature, 'resolution_signature'] = prepared.loc[missing_signature].apply(
+            _resolution_signature_from_row,
+            axis=1,
+        )
+    if 'resolution_status' not in prepared.columns:
+        prepared['resolution_status'] = ''
+    if 'resolved_video_id' not in prepared.columns:
+        prepared['resolved_video_id'] = ''
+    if 'resolved_title' not in prepared.columns:
+        prepared['resolved_title'] = ''
+    if 'resolved_artist' not in prepared.columns:
+        prepared['resolved_artist'] = ''
+    if 'resolved_duration_seconds' not in prepared.columns:
+        prepared['resolved_duration_seconds'] = pd.NA
+    compacted = prepared.reindex(columns=RESOLUTION_CACHE_COLUMNS)
+    return compacted.sort_values(['video_id', 'position'], kind='stable').reset_index(drop=True)
+
+
+def _restore_resolution_cache_row(
+    resolution_row: dict[str, Any],
+    *,
+    query: str,
+    normalized_query: str,
+    max_results: int,
+) -> dict[str, Any]:
+    resolved_video_id = str(resolution_row.get('resolved_video_id') or '').strip()
+    return {
+        'video_id': str(resolution_row.get('video_id') or '').strip(),
+        'position': resolution_row.get('position', pd.NA),
+        'search_query': str(query).strip(),
+        'normalized_search_query': str(normalized_query).strip(),
+        'search_max_results': int(max(1, int(max_results))),
+        'resolution_cache_version': int(RESOLUTION_CACHE_VERSION),
+        'resolution_status': str(resolution_row.get('resolution_status') or '').strip(),
+        'resolved_video_id': resolved_video_id,
+        'resolved_title': str(resolution_row.get('resolved_title') or '').strip(),
+        'resolved_artist': str(resolution_row.get('resolved_artist') or '').strip(),
+        'resolved_url': normalize_video_url(resolved_video_id) if resolved_video_id else '',
+        'resolved_duration_seconds': resolution_row.get('resolved_duration_seconds', pd.NA),
+    }
+
+
 def _channel_cache_path(cache_dir: str, channel_url: str) -> str:
     slug = channel_handle_from_url(channel_url) or _slugify(channel_url)
     return os.path.join(_training_cache_root(cache_dir), 'channel_videos', f'{slug}_{_hash_text(channel_url)[:10]}.json')
@@ -664,9 +952,75 @@ def _write_cache_table(path: str, df: pd.DataFrame, columns: list[str]) -> None:
                 pass
 
 
+def compact_training_cache(cache_dir: str = 'data/cache') -> dict[str, int]:
+    training_root = _training_cache_root(cache_dir)
+    summary = {
+        'channel_video_files': 0,
+        'search_result_files': 0,
+        'video_metadata_files': 0,
+        'source_track_rows': 0,
+        'resolution_rows': 0,
+        'bytes_before': 0,
+        'bytes_after': 0,
+    }
+    if not os.path.isdir(training_root):
+        return summary
+
+    source_track_cache_path = _source_track_cache_path(cache_dir)
+    if os.path.exists(source_track_cache_path):
+        summary['bytes_before'] += int(os.path.getsize(source_track_cache_path))
+        source_track_cache_df = _compact_source_track_cache_rows(
+            _read_cache_table(source_track_cache_path, SOURCE_TRACK_CACHE_COLUMNS)
+        )
+        _write_cache_table(source_track_cache_path, source_track_cache_df, SOURCE_TRACK_CACHE_COLUMNS)
+        summary['bytes_after'] += int(os.path.getsize(source_track_cache_path))
+        summary['source_track_rows'] = int(len(source_track_cache_df))
+
+    resolution_cache_path = _resolution_cache_path(cache_dir)
+    if os.path.exists(resolution_cache_path):
+        summary['bytes_before'] += int(os.path.getsize(resolution_cache_path))
+        resolution_cache_df = _compact_resolution_cache_rows(
+            _read_cache_table(resolution_cache_path, RESOLUTION_CACHE_COLUMNS)
+        )
+        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_CACHE_COLUMNS)
+        summary['bytes_after'] += int(os.path.getsize(resolution_cache_path))
+        summary['resolution_rows'] = int(len(resolution_cache_df))
+
+    for directory_name, payload_builder, counter_key in (
+        ('channel_videos', lambda payload: {'entries': _compact_channel_video_entries(payload.get('entries') or [])}, 'channel_video_files'),
+        ('search_results', lambda payload: {'entries': _compact_search_entries(payload.get('entries') or [])}, 'search_result_files'),
+        ('video_metadata', _compact_video_metadata, 'video_metadata_files'),
+    ):
+        directory = os.path.join(training_root, directory_name)
+        if not os.path.isdir(directory):
+            continue
+        for filename in sorted(os.listdir(directory)):
+            if not filename.endswith('.json'):
+                continue
+            path = os.path.join(directory, filename)
+            payload = _read_json(path)
+            if payload is None:
+                continue
+            summary['bytes_before'] += int(os.path.getsize(path))
+            compacted_payload = payload_builder(payload)
+            _write_json_atomic(path, compacted_payload)
+            summary['bytes_after'] += int(os.path.getsize(path))
+            summary[counter_key] += 1
+
+    return summary
+
+
 def _source_track_rows_are_valid(cached_rows_df: pd.DataFrame, channel_config: dict[str, str]) -> bool:
     if cached_rows_df.empty:
         return False
+    if 'source_signature' in cached_rows_df.columns:
+        signature_values = cached_rows_df['source_signature'].fillna('').astype(str).str.strip()
+        expected_signature = _source_track_signature(
+            str(channel_config['url']),
+            str(channel_config['label']),
+            str(channel_config['label_source']),
+        )
+        return bool(not signature_values.empty and signature_values.eq(expected_signature).all())
     if 'source_cache_version' not in cached_rows_df.columns:
         return False
 
@@ -694,6 +1048,13 @@ def _resolution_row_is_valid(
     normalized_query: str,
     max_results: int,
 ) -> bool:
+    cached_signature = str(resolution_row.get('resolution_signature') or '').strip()
+    if cached_signature:
+        return cached_signature == _resolution_signature(
+            normalized_query=normalized_query,
+            max_results=max_results,
+        )
+
     try:
         cache_version = int(resolution_row.get('resolution_cache_version'))
         cached_max_results = int(resolution_row.get('search_max_results'))
@@ -730,19 +1091,20 @@ def _metadata_value_to_text(value: Any) -> str:
 
 
 def _replace_source_track_rows(cache_df: pd.DataFrame, video_id: str, rows_df: pd.DataFrame) -> pd.DataFrame:
-    prepared = cache_df.copy()
+    prepared = _compact_source_track_cache_rows(cache_df)
     if not prepared.empty and 'video_id' in prepared.columns:
         prepared = prepared.loc[prepared['video_id'].fillna('').astype(str) != str(video_id)].copy()
     if rows_df.empty:
         return prepared.reset_index(drop=True)
-    combined = pd.concat([prepared, rows_df.reindex(columns=SOURCE_TRACK_COLUMNS)], ignore_index=True, sort=False)
+    combined = pd.concat([prepared, _compact_source_track_cache_rows(rows_df)], ignore_index=True, sort=False)
     return combined.sort_values(['video_id', 'position'], kind='stable').reset_index(drop=True)
 
 
 def _upsert_resolution_rows(cache_df: pd.DataFrame, rows_df: pd.DataFrame) -> pd.DataFrame:
     if rows_df.empty:
-        return cache_df.copy()
-    prepared = cache_df.copy()
+        return _compact_resolution_cache_rows(cache_df)
+    prepared = _compact_resolution_cache_rows(cache_df)
+    new_rows_df = _compact_resolution_cache_rows(rows_df)
     if not prepared.empty:
         existing_keys = (
             prepared[['video_id', 'position']]
@@ -751,14 +1113,14 @@ def _upsert_resolution_rows(cache_df: pd.DataFrame, rows_df: pd.DataFrame) -> pd
             .agg('||'.join, axis=1)
         )
         new_keys = set(
-            rows_df[['video_id', 'position']]
+            new_rows_df[['video_id', 'position']]
             .astype({'video_id': 'string', 'position': 'string'})
             .fillna('')
             .agg('||'.join, axis=1)
             .tolist()
         )
         prepared = prepared.loc[~existing_keys.isin(new_keys)].copy()
-    combined = pd.concat([prepared, rows_df.reindex(columns=RESOLUTION_COLUMNS)], ignore_index=True, sort=False)
+    combined = pd.concat([prepared, new_rows_df.reindex(columns=RESOLUTION_CACHE_COLUMNS)], ignore_index=True, sort=False)
     return combined.sort_values(['video_id', 'position'], kind='stable').reset_index(drop=True)
 
 
@@ -770,7 +1132,7 @@ def _extract_search_entries(info: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for entry in info.get('entries') or []:
         if isinstance(entry, dict):
-            entries.append(entry)
+            entries.append(_compact_search_candidate(entry))
     return entries
 
 
@@ -837,11 +1199,7 @@ def search_youtube_track_candidates(
         _write_json_atomic(
             cache_path,
             {
-                'query': query,
-                'normalized_query': normalized_query,
-                'max_results': normalized_max_results,
-                'entries': entries,
-                'error': error_message,
+                'entries': _compact_search_entries(entries),
             },
         )
     logger.info('YouTube search result [%d]: %s -> %d candidates', normalized_max_results, query, len(entries))
@@ -1148,13 +1506,12 @@ def fetch_channel_video_entries(
         if not info:
             raise RuntimeError(f'yt-dlp returned no channel metadata for {channel_url}')
         payload = {
-            'channel_url': channel_url,
-            'entries': info.get('entries') or [],
+            'entries': _compact_channel_video_entries(info.get('entries') or []),
         }
         if cache_path:
             _write_json_atomic(cache_path, payload)
 
-    entries = payload.get('entries') or []
+    entries = _compact_channel_video_entries(payload.get('entries') or [])
     seen_video_ids: set[str] = set()
     rows: list[dict[str, str]] = []
     for entry in entries:
@@ -1183,7 +1540,7 @@ def fetch_video_metadata(
     cache_path = _video_metadata_cache_path(cache_dir, video_id) if cache_dir else None
     cached = _read_json(cache_path) if cache_path and not refresh else None
     if cached is not None:
-        return cached
+        return _compact_video_metadata(cached)
 
     ydl_opts = {
         'quiet': True,
@@ -1197,9 +1554,10 @@ def fetch_video_metadata(
         metadata = ydl.extract_info(video_url, download=False) or {}
     if not metadata:
         raise RuntimeError(f'yt-dlp returned no video metadata for {video_id}')
+    compacted_metadata = _compact_video_metadata(metadata)
     if cache_path:
-        _write_json_atomic(cache_path, metadata)
-    return metadata
+        _write_json_atomic(cache_path, compacted_metadata)
+    return compacted_metadata
 
 
 def _fetch_resolved_track_metadata_row(
@@ -1398,9 +1756,12 @@ def scrape_channel_track_rows(
     _emit_progress(progress_callback, 'Loading channel index', 1, 1, f'{channel_label} found {len(video_entries)} videos')
 
     source_track_cache_path = _source_track_cache_path(cache_dir) if cache_dir else ''
-    source_track_cache_df = _read_cache_table(source_track_cache_path, SOURCE_TRACK_COLUMNS) if cache_dir else pd.DataFrame(columns=SOURCE_TRACK_COLUMNS)
+    source_track_cache_df = (
+        _compact_source_track_cache_rows(_read_cache_table(source_track_cache_path, SOURCE_TRACK_CACHE_COLUMNS))
+        if cache_dir else pd.DataFrame(columns=SOURCE_TRACK_CACHE_COLUMNS)
+    )
     cached_source_track_groups = {
-        str(video_id): group.reindex(columns=SOURCE_TRACK_COLUMNS).copy()
+        str(video_id): group.reindex(columns=SOURCE_TRACK_CACHE_COLUMNS).copy()
         for video_id, group in source_track_cache_df.groupby('video_id', sort=False)
     } if not source_track_cache_df.empty else {}
 
@@ -1411,14 +1772,18 @@ def scrape_channel_track_rows(
     for video_number, video in enumerate(video_entries, start=1):
         summary['videos_scanned'] += 1
         source_video_id = str(video['video_id'])
-        cached_rows_df = cached_source_track_groups.get(source_video_id, pd.DataFrame(columns=SOURCE_TRACK_COLUMNS)) if not refresh else pd.DataFrame(columns=SOURCE_TRACK_COLUMNS)
+        cached_rows_df = cached_source_track_groups.get(source_video_id, pd.DataFrame(columns=SOURCE_TRACK_CACHE_COLUMNS)) if not refresh else pd.DataFrame(columns=SOURCE_TRACK_CACHE_COLUMNS)
         if not _source_track_rows_are_valid(cached_rows_df, channel_config):
-            cached_rows_df = pd.DataFrame(columns=SOURCE_TRACK_COLUMNS)
+            cached_rows_df = pd.DataFrame(columns=SOURCE_TRACK_CACHE_COLUMNS)
 
         if cached_rows_df.empty:
             pending_videos.append((video_number, video))
             continue
-        active_rows_df = cached_rows_df.reindex(columns=SOURCE_TRACK_COLUMNS)
+        active_rows_df = _restore_source_track_cache_rows(
+            cached_rows_df,
+            channel_config=channel_config,
+            video=video,
+        )
 
         parsed_count = int(len(active_rows_df))
         if parsed_count < 2:
@@ -1487,7 +1852,7 @@ def scrape_channel_track_rows(
 
             _, active_rows_df = result
             active_rows_df = active_rows_df.reindex(columns=SOURCE_TRACK_COLUMNS)
-            cache_updates.append((source_video_id, active_rows_df))
+            cache_updates.append((source_video_id, _compact_source_track_cache_rows(active_rows_df)))
 
             parsed_count = int(len(active_rows_df))
             if parsed_count < 2:
@@ -1509,7 +1874,7 @@ def scrape_channel_track_rows(
     if cache_dir and cache_updates:
         for source_video_id, rows_df in cache_updates:
             source_track_cache_df = _replace_source_track_rows(source_track_cache_df, source_video_id, rows_df)
-        _write_cache_table(source_track_cache_path, source_track_cache_df, SOURCE_TRACK_COLUMNS)
+        _write_cache_table(source_track_cache_path, source_track_cache_df, SOURCE_TRACK_CACHE_COLUMNS)
 
     return source_tracks_dataframe(track_rows), summary
 
@@ -1585,7 +1950,10 @@ def resolve_scraped_tracks(
         }
 
     resolution_cache_path = _resolution_cache_path(cache_dir) if cache_dir else ''
-    resolution_cache_df = _read_cache_table(resolution_cache_path, RESOLUTION_COLUMNS) if cache_dir else pd.DataFrame(columns=RESOLUTION_COLUMNS)
+    resolution_cache_df = (
+        _compact_resolution_cache_rows(_read_cache_table(resolution_cache_path, RESOLUTION_CACHE_COLUMNS))
+        if cache_dir else pd.DataFrame(columns=RESOLUTION_CACHE_COLUMNS)
+    )
     resolution_lookup = {
         (str(row.get('video_id') or ''), int(row.get('position'))): row
         for row in resolution_cache_df.to_dict(orient='records')
@@ -1624,7 +1992,12 @@ def resolve_scraped_tracks(
         ):
             pending_rows.append({
                 'row': row.to_dict(),
-                'resolution_row': cached_resolution_row.copy(),
+                'resolution_row': _restore_resolution_cache_row(
+                    cached_resolution_row.copy(),
+                    query=query,
+                    normalized_query=normalized_query,
+                    max_results=max_results,
+                ),
                 'resolution_source': 'cache',
             })
             continue
@@ -1781,7 +2154,7 @@ def resolve_scraped_tracks(
             resolution_cache_df,
             resolution_dataframe(new_resolution_rows),
         )
-        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_COLUMNS)
+        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_CACHE_COLUMNS)
 
     return scraped_tracks_dataframe(rows), summary
 
@@ -1805,7 +2178,10 @@ def analyze_resolved_tracks(
         return track_df.copy(), {'tracks_analyzed': 0, 'tracks_with_features': 0, 'tracks_analysis_failed': 0}
 
     resolution_cache_path = _resolution_cache_path(cache_dir) if cache_dir else ''
-    resolution_cache_df = _read_cache_table(resolution_cache_path, RESOLUTION_COLUMNS) if cache_dir else pd.DataFrame(columns=RESOLUTION_COLUMNS)
+    resolution_cache_df = (
+        _compact_resolution_cache_rows(_read_cache_table(resolution_cache_path, RESOLUTION_CACHE_COLUMNS))
+        if cache_dir else pd.DataFrame(columns=RESOLUTION_CACHE_COLUMNS)
+    )
 
     resolved_tracks = track_df.loc[
         track_df['resolution_status'].fillna('').astype(str).eq('resolved')
@@ -1873,7 +2249,7 @@ def analyze_resolved_tracks(
     if cache_dir:
         updated_rows_df = resolution_dataframe(merged.reindex(columns=RESOLUTION_COLUMNS).to_dict(orient='records'))
         resolution_cache_df = _upsert_resolution_rows(resolution_cache_df, updated_rows_df)
-        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_COLUMNS)
+        _write_cache_table(resolution_cache_path, resolution_cache_df, RESOLUTION_CACHE_COLUMNS)
 
     tracks_with_features = int(merged.apply(lambda row: _track_row_has_analysis(row, flow_profile=flow_profile), axis=1).sum())
     tracks_analysis_failed = int(failure_mask.sum())
