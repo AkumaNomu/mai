@@ -9,8 +9,7 @@ import time
 
 # Fix Windows UTF-8 encoding issue
 if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # ANSI color codes for terminal
 class Colors:
