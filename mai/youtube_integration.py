@@ -69,6 +69,7 @@ def fetch_youtube_playlist_tracks(
         'quiet': True,
         'extract_flat': 'in_playlist',
         'skip_download': True,
+        'extractor_args': {'youtube': {'player_skip': ['js']}},
     }
     with YoutubeDL(apply_yt_dlp_auth_options(ydl_opts)) as ydl:
         info = ydl.extract_info(playlist_url, download=False)

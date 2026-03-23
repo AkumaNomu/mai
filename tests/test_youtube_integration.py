@@ -61,6 +61,8 @@ class YoutubeIntegrationTests(unittest.TestCase):
         self.assertEqual(youtube_dl_mock.call_count, 1)
         self.assertEqual(auth_mock.call_count, 1)
         self.assertEqual(FakeYoutubePlaylistDL.calls[0][1].get('cookiefile'), 'cookies.txt')
+        forwarded_opts = auth_mock.call_args.args[0]
+        self.assertEqual(forwarded_opts.get('extractor_args'), {'youtube': {'player_skip': ['js']}})
 
 
 if __name__ == '__main__':

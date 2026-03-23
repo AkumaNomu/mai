@@ -44,7 +44,30 @@ class YtDlpAuthTests(unittest.TestCase):
         opts = yt_dlp_auth.apply_yt_dlp_auth_options({'quiet': True}, cookiefile='missing-cookies.txt')
 
         self.assertNotIn('cookiefile', opts)
+        self.assertIs(opts['cachedir'], False)
         self.assertTrue(opts['quiet'])
+
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={'node': {'path': 'C:\\node.exe'}})
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value=None)
+    def test_apply_yt_dlp_auth_options_skips_js_runtime_setup_when_player_skip_js(self, ffmpeg_mock, js_runtime_mock):
+        opts = yt_dlp_auth.apply_yt_dlp_auth_options({
+            'quiet': True,
+            'extractor_args': {'youtube': {'player_skip': ['js']}},
+        })
+
+        self.assertNotIn('js_runtimes', opts)
+        self.assertNotIn('remote_components', opts)
+        self.assertEqual(opts['extractor_args'], {'youtube': {'player_skip': ['js'], 'player_client': ['android_vr']}})
+        js_runtime_mock.assert_not_called()
+
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={})
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value=None)
+    def test_apply_yt_dlp_auth_options_allows_internal_cache_with_env_override(self, ffmpeg_mock, js_runtime_mock):
+        with patch.dict(os.environ, {'MAI_YTDLP_ENABLE_INTERNAL_CACHE': '1'}, clear=False):
+            opts = yt_dlp_auth.apply_yt_dlp_auth_options({'quiet': True})
+
+        self.assertNotEqual(opts['cachedir'], False)
+        self.assertIn('yt_dlp_internal', opts['cachedir'])
 
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={})
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value=None)
@@ -115,13 +138,15 @@ class YtDlpAuthTests(unittest.TestCase):
         self.assertEqual(data_lines, [VALID_COOKIE_ROW.strip()])
 
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value=None)
+    @patch('mai.yt_dlp_auth._ensure_windows_deno_runtime', return_value={})
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={'node': {'path': 'C:\\node.exe'}})
-    def test_apply_yt_dlp_auth_options_enables_node_and_remote_ejs_fallback(self, js_runtime_mock, ffmpeg_mock):
+    def test_apply_yt_dlp_auth_options_skips_node_runtime_by_default(self, js_runtime_mock, deno_fallback_mock, ffmpeg_mock):
         opts = yt_dlp_auth.apply_yt_dlp_auth_options({'quiet': True})
 
-        self.assertEqual(opts['js_runtimes'], {'node': {'path': 'C:\\node.exe'}})
+        self.assertNotIn('js_runtimes', opts)
         self.assertIn('ejs:github', opts['remote_components'])
         self.assertTrue(opts['quiet'])
+        deno_fallback_mock.assert_called_once()
 
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={})
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value=None)
@@ -131,6 +156,29 @@ class YtDlpAuthTests(unittest.TestCase):
         self.assertNotIn('js_runtimes', opts)
         self.assertIn('ejs:github', opts['remote_components'])
         self.assertTrue(opts['quiet'])
+
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value=None)
+    @patch('mai.yt_dlp_auth._ensure_windows_deno_runtime', return_value={'deno': {'path': 'C:\\deno.exe'}})
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={'node': {'path': 'C:\\node.exe'}})
+    def test_apply_yt_dlp_auth_options_allows_node_runtime_with_env_override(self, js_runtime_mock, deno_fallback_mock, ffmpeg_mock):
+        with patch.dict(os.environ, {'MAI_YTDLP_ALLOW_NODE_RUNTIME': '1'}, clear=False):
+            opts = yt_dlp_auth.apply_yt_dlp_auth_options({'quiet': True})
+
+        self.assertEqual(opts['js_runtimes'], {'node': {'path': 'C:\\node.exe'}})
+        self.assertIn('ejs:github', opts['remote_components'])
+        self.assertTrue(opts['quiet'])
+        deno_fallback_mock.assert_not_called()
+
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value=None)
+    @patch('mai.yt_dlp_auth._ensure_windows_deno_runtime', return_value={'deno': {'path': 'C:\\deno.exe'}})
+    @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={'node': {'path': 'C:\\node.exe'}})
+    def test_apply_yt_dlp_auth_options_uses_deno_fallback_when_only_node_detected(self, js_runtime_mock, deno_fallback_mock, ffmpeg_mock):
+        opts = yt_dlp_auth.apply_yt_dlp_auth_options({'quiet': True})
+
+        self.assertEqual(opts['js_runtimes'], {'deno': {'path': 'C:\\deno.exe'}})
+        self.assertIn('ejs:github', opts['remote_components'])
+        self.assertTrue(opts['quiet'])
+        deno_fallback_mock.assert_called_once()
 
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_js_runtime', return_value={})
     @patch('mai.yt_dlp_auth.ensure_yt_dlp_ffmpeg_location', return_value='data\\tools\\ffmpeg\\bin')
@@ -142,9 +190,10 @@ class YtDlpAuthTests(unittest.TestCase):
 
     @patch('mai.yt_dlp_auth.urllib.request.urlretrieve')
     @patch('mai.yt_dlp_auth.shutil.which', return_value=None)
-    def test_ensure_yt_dlp_js_runtime_downloads_local_deno_on_windows_when_missing(self, which_mock, urlretrieve_mock):
+    @patch('mai.yt_dlp_auth._is_usable_js_runtime_binary', side_effect=lambda path, **kwargs: Path(path).exists())
+    def test_ensure_yt_dlp_js_runtime_downloads_local_deno_on_windows_when_missing(self, runtime_ok_mock, which_mock, urlretrieve_mock):
         with tempfile.TemporaryDirectory() as tmpdir:
-            def fake_urlretrieve(url, destination):
+            def fake_urlretrieve(url, destination, reporthook=None):
                 zip_path = Path(destination)
                 zip_path.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.TemporaryDirectory() as zipdir:
@@ -153,6 +202,8 @@ class YtDlpAuthTests(unittest.TestCase):
                     import zipfile
                     with zipfile.ZipFile(zip_path, 'w') as zf:
                         zf.write(deno_path, arcname='deno.exe')
+                if callable(reporthook):
+                    reporthook(1, 1024, 1024)
                 return str(zip_path), None
 
             urlretrieve_mock.side_effect = fake_urlretrieve

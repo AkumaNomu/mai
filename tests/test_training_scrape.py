@@ -1,6 +1,8 @@
 import json
+import logging
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +23,7 @@ def fake_analyze_youtube_playlist_audio(
     download_workers=1,
     analysis_workers=1,
     delete_audio_after_analysis=True,
+    reuse_cache_any_signature=False,
     progress_callback=None,
 ):
     del resource_profile
@@ -61,6 +64,82 @@ class TrainingScrapeParserTests(unittest.TestCase):
         self.assertEqual(rows[0]['track_raw'], 'Song A - Artist A')
         self.assertEqual(rows[1]['timestamp'], '01:02:03')
         self.assertEqual(rows[1]['timestamp_s'], 3723)
+
+    def test_format_scrape_summary_report_includes_percentages(self):
+        report = training_scrape.format_scrape_summary_report(
+            {
+                'channels_scanned': 4,
+                'channels_failed': 1,
+                'videos_scanned': 10,
+                'videos_with_tracklist': 7,
+                'videos_skipped': 3,
+                'tracks_parsed': 100,
+                'tracks_resolved': 80,
+                'tracks_unresolved': 20,
+                'tracks_unavailable': 0,
+                'tracks_analyzed': 70,
+                'tracks_with_features': 35,
+                'tracks_analysis_failed': 35,
+                'positive_pairs': 25,
+                'pairs_skipped': 75,
+            },
+            output_path='data/training/positive_transitions.csv',
+            errors_path='data/training/positive_transitions_errors_20260323_120000.log',
+            warning_count=5,
+            error_count=2,
+        )
+        self.assertIn('Training Scrape Report', report)
+        self.assertIn('channels_failed=1 (25.0%)', report)
+        self.assertIn('resolved=80 (80.0%)', report)
+        self.assertIn('kept_rate=25.0%', report)
+        self.assertIn('warnings=5 errors=2', report)
+
+    def test_session_error_capture_handler_collects_warning_and_error_entries(self):
+        handler = training_scrape.SessionErrorCaptureHandler()
+        test_logger = logging.getLogger('tests.training_scrape.capture')
+        original_level = test_logger.level
+        original_propagate = test_logger.propagate
+        test_logger.setLevel(logging.DEBUG)
+        test_logger.propagate = False
+        test_logger.addHandler(handler)
+        try:
+            test_logger.warning('warning message')
+            test_logger.error('error message')
+        finally:
+            test_logger.removeHandler(handler)
+            test_logger.setLevel(original_level)
+            test_logger.propagate = original_propagate
+
+        entries = handler.entries
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(handler.warning_count, 1)
+        self.assertEqual(handler.error_count, 1)
+        self.assertEqual(entries[0]['level'], 'WARNING')
+        self.assertEqual(entries[1]['level'], 'ERROR')
+
+    def test_write_session_errors_report_writes_header_and_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / 'session_errors.log'
+            training_scrape._write_session_errors_report(
+                str(out_path),
+                entries=[
+                    {
+                        'timestamp': '2026-03-23 11:11:11',
+                        'level': 'WARNING',
+                        'logger': 'mai.training_scrape',
+                        'message': 'sample warning',
+                    }
+                ],
+                run_started_at=datetime(2026, 3, 23, 11, 0, 0),
+                run_finished_at=datetime(2026, 3, 23, 11, 30, 0),
+                run_failed=False,
+            )
+            text = out_path.read_text(encoding='utf-8')
+
+        self.assertIn('Mai Training Scrape Session Errors', text)
+        self.assertIn('run_status=success', text)
+        self.assertIn('captured_entries=1', text)
+        self.assertIn('sample warning', text)
 
     def test_parse_tracklist_description_preserves_unicode(self):
         rows = training_scrape.parse_tracklist_description(
@@ -205,6 +284,8 @@ class TrainingScrapeResolutionTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(auth_mock.call_count, 1)
         self.assertEqual(CookieAwareYoutubeDL.calls[0].get('cookiefile'), 'cookies.txt')
+        forwarded_opts = auth_mock.call_args.args[0]
+        self.assertEqual(forwarded_opts.get('extractor_args'), {'youtube': {'player_skip': ['js']}})
 
     def test_search_youtube_track_candidates_filters_missing_entries(self):
         class MissingEntryYoutubeDL:
@@ -1294,8 +1375,34 @@ class TrainingScrapeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(loaded.columns[0], 'video_id')
         self.assertEqual(loaded.loc[0, 'from_track_source'], 'description+chapters')
-        self.assertIn('from_tempo', loaded.columns)
-        self.assertIn('to_outro_release_time_s', loaded.columns)
+        self.assertIn('from_track_raw', loaded.columns)
+        self.assertIn('to_track_raw', loaded.columns)
+        self.assertNotIn('description_length', loaded.columns)
+        self.assertNotIn('from_timestamp', loaded.columns)
+        self.assertNotIn('to_timestamp', loaded.columns)
+        self.assertNotIn('from_tempo', loaded.columns)
+        self.assertNotIn('to_outro_release_time_s', loaded.columns)
+
+    def test_write_training_transitions_csv_flattens_multiline_descriptions(self):
+        df = pd.DataFrame([
+            {
+                'video_id': 'mix-1',
+                'label': 'excellent',
+                'label_source': 'manual',
+                'from_track_source': 'description',
+                'to_track_source': 'description',
+                'from_description': 'line one\nline two\n\nline three',
+                'to_description': 'first\r\nsecond',
+            }
+        ])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / 'training.csv'
+            training_scrape.write_training_transitions_csv(df, str(out_path))
+            loaded = pd.read_csv(out_path, encoding='utf-8')
+
+        self.assertEqual(loaded.loc[0, 'from_description'], 'line one | line two | line three')
+        self.assertEqual(loaded.loc[0, 'to_description'], 'first | second')
 
 
 if __name__ == '__main__':

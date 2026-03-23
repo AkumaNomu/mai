@@ -9,6 +9,7 @@ from sklearn.preprocessing import RobustScaler
 
 from .genre import GENRE_SOURCE_MIN_CONFIDENCE, resolve_genres
 from .sentiment import SENTIMENT_DIMS, add_sentiment_features
+from .transition_model import TransitionModelArtifact, score_transition_matrix as score_transition_model_matrix
 from .tonal import kk_key_transition_similarity
 
 
@@ -465,10 +466,15 @@ def _structure_cadence_component(df: pd.DataFrame) -> np.ndarray | None:
 def compute_transition_scores(
     df: pd.DataFrame,
     flow_profile: str = 'deep-dj',
+    transition_model: TransitionModelArtifact | None = None,
+    transition_model_weight: float = 0.0,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Build a directed transition matrix from edge flow, structure, sentiment, groove, timbre, and key features."""
-    total_steps = 8
+    if transition_model_weight < 0:
+        raise ValueError('transition_model_weight must be non-negative')
+    model_enabled = transition_model is not None and transition_model_weight > 0
+    total_steps = 8 + (1 if model_enabled else 0)
     df = add_sentiment_features(df)
     _emit_progress(progress_callback, 'Transition scoring', 1, total_steps, 'prepared sentiment features')
     components: list[tuple[str, np.ndarray, float]] = []
@@ -532,8 +538,20 @@ def compute_transition_scores(
     components.append(('tonal_score', key_flow.astype(np.float32), TRANSITION_COMPONENT_WEIGHTS['tonal_score']))
     _emit_progress(progress_callback, 'Transition scoring', 7, total_steps, 'tonal')
 
+    if model_enabled:
+        try:
+            model_flow = score_transition_model_matrix(transition_model, df)
+            logger.info('Transition scoring: trained transition model component.')
+            components.append(('transition_model_score', model_flow.astype(np.float32), float(transition_model_weight)))
+            _emit_progress(progress_callback, 'Transition scoring', 8, total_steps, 'trained transition model')
+        except Exception:
+            logger.exception('Transition scoring: trained transition model component failed; continuing without it.')
+            _emit_progress(progress_callback, 'Transition scoring', 8, total_steps, 'trained transition model skipped')
+    elif transition_model_weight > 0:
+        logger.info('Transition scoring: trained transition model component skipped (no model provided).')
+
     transition_scores = _combine_weighted(components)
-    _emit_progress(progress_callback, 'Transition scoring', 8, total_steps, 'combined transition matrix')
+    _emit_progress(progress_callback, 'Transition scoring', total_steps, total_steps, 'combined transition matrix')
     return transition_scores, df
 
 

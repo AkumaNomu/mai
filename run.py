@@ -18,6 +18,15 @@ from mai.playlist_generation import (
     ordered_playlist_paths_from_dataframe,
     playlists_to_dataframe,
 )
+from mai.transition_model import (
+    DEFAULT_TRANSITION_MODEL_DEVICE,
+    DEFAULT_TRANSITION_MODEL_NEGATIVE_RATIO,
+    DEFAULT_TRANSITION_MODEL_PATH,
+    DEFAULT_TRANSITION_MODEL_RANDOM_STATE,
+    load_transition_model_if_exists,
+    save_transition_model,
+    train_transition_model,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -194,6 +203,14 @@ def build_parser(config: dict, config_path: str, no_config: bool) -> argparse.Ar
     parser.add_argument('--beam-width', type=int, default=int(get_config_value(config, 'generation.beam_width', 8)), help='Beam width for playlist generation search')
     parser.add_argument('--candidate-width', '--k', dest='candidate_width', type=int, default=int(get_config_value(config, 'generation.candidate_width', 25)), help='Top transition candidates explored per step')
     parser.add_argument('--input-order-column', default=get_config_value(config, 'generation.input_order_column', '') or None, help='Column to use when rating the current playlist order (defaults to row order or existing `position`)')
+    parser.add_argument('--train-transition-model', action='store_true', help='Train a supervised transition model from the positive transition CSV before playlist scoring')
+    parser.add_argument('--transition-model-train-csv', default=get_config_value(config, 'training.output_path', 'data/training/positive_transitions.csv'), help='CSV file containing positive transition rows for model training')
+    parser.add_argument('--transition-model-out', default=DEFAULT_TRANSITION_MODEL_PATH, help='Path where a trained transition model artifact should be written')
+    parser.add_argument('--transition-model-path', default='', help='Path to a saved transition model artifact to load for scoring')
+    parser.add_argument('--transition-model-weight', type=float, default=0.0, help='Weight to give the transition model component when blending transition scores')
+    parser.add_argument('--transition-model-negative-ratio', type=float, default=DEFAULT_TRANSITION_MODEL_NEGATIVE_RATIO, help='Number of synthetic negatives to create per positive training row')
+    parser.add_argument('--transition-model-random-state', type=int, default=DEFAULT_TRANSITION_MODEL_RANDOM_STATE, help='Random seed used when synthesizing negative training rows')
+    parser.add_argument('--transition-model-device', choices=['cuda', 'cpu', 'auto'], default=get_config_value(config, 'training.transition_model_device', DEFAULT_TRANSITION_MODEL_DEVICE), help='Training device for transition model (`cuda` uses GPU, `cpu` uses CPU, `auto` picks CUDA when available)')
     _add_bool_override(
         parser,
         true_flag='--rate-transitions',
@@ -226,6 +243,27 @@ def main(argv: Sequence[str] | None = None):
     progress = CliProgressRenderer()
 
     try:
+        transition_model = None
+        if args.train_transition_model:
+            progress.section('Training transition model', args.transition_model_train_csv)
+            training_df = load_csv_playlist(args.transition_model_train_csv)
+            training_df = prepare_df(training_df)
+            if training_df.empty:
+                raise SystemExit(f'transition model training CSV is empty: {args.transition_model_train_csv}')
+            transition_model = train_transition_model(
+                training_df,
+                negative_ratio=float(args.transition_model_negative_ratio),
+                random_state=int(args.transition_model_random_state),
+                device=str(args.transition_model_device),
+            )
+            save_transition_model(transition_model, args.transition_model_out)
+            progress.success(
+                'Transition model trained',
+                f"{transition_model.training_summary.get('positive_rows', 0)} positive rows, "
+                f"{transition_model.training_summary.get('negative_rows', 0)} synthetic negatives",
+            )
+            print('Wrote transition model to', args.transition_model_out)
+
         source_playlist_title = ''
         if args.youtube_playlist:
             try:
@@ -272,6 +310,8 @@ def main(argv: Sequence[str] | None = None):
             logger.info('Loading CSV: %s', args.csv)
             df = load_csv_playlist(args.csv)
         else:
+            if args.train_transition_model:
+                return
             raise SystemExit('Provide --csv or --youtube-playlist')
 
         df = prepare_df(df)
@@ -280,9 +320,16 @@ def main(argv: Sequence[str] | None = None):
             raise SystemExit('playlist-size cannot exceed the available track count unless --allow-reuse is set')
 
         logger.info('Computing directed transition scores for %d tracks...', len(df))
+        if transition_model is None and args.transition_model_path:
+            transition_model = load_transition_model_if_exists(args.transition_model_path)
+            if transition_model is None:
+                logger.warning('Transition model artifact not found at %s; continuing without the ML component.', args.transition_model_path)
+        transition_model_weight = float(args.transition_model_weight) if transition_model is not None else 0.0
         transition_scores, scored_df = compute_transition_scores(
             df,
             flow_profile=args.flow_profile,
+            transition_model=transition_model,
+            transition_model_weight=transition_model_weight,
             progress_callback=progress.update,
         )
         try:

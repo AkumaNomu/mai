@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from datetime import datetime
 import hashlib
 import json
 import logging
 import os
 import re
 import tempfile
+from threading import Lock
+import time
 import unicodedata
 from typing import Any, Callable, Optional, Sequence
 
@@ -33,6 +36,11 @@ DEFAULT_METADATA_WORKERS = 4
 DEFAULT_SEARCH_WORKERS = 4
 YTDLP_SOCKET_TIMEOUT_SECONDS = 20.0
 YTDLP_EXTRACTOR_RETRIES = 2
+YTDLP_RATE_LIMIT_MAX_RETRIES = 3
+YTDLP_RATE_LIMIT_BACKOFF_SECONDS = 2.0
+YTDLP_RATE_LIMIT_MAX_BACKOFF_SECONDS = 30.0
+YTDLP_MIN_REQUEST_INTERVAL_SECONDS = 0.0
+FUTURE_WAIT_HEARTBEAT_SECONDS = 10.0
 SOURCE_TRACK_CACHE_VERSION = 4
 RESOLUTION_CACHE_VERSION = 4
 MAX_SEARCH_DURATION_SECONDS = 15 * 60
@@ -57,6 +65,38 @@ MATCH_STOPWORDS = {
 }
 UNAVAILABLE_TITLES = {'[deleted video]', '[private video]'}
 WATCH_METADATA_LIST_KEYS = ('music_tracks', 'tracks', 'tracklist', 'music_sections')
+
+_YTDLP_REQUEST_LOCK = Lock()
+_YTDLP_NEXT_REQUEST_AT = 0.0
+_YTDLP_GLOBAL_RATE_LIMIT_LOCK = Lock()
+_YTDLP_GLOBAL_RATE_LIMIT_UNTIL = 0.0
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.getenv(name) or '').strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.getenv(name) or '').strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+YTDLP_RATE_LIMIT_MAX_RETRIES = _env_int('MAI_YTDLP_RATE_LIMIT_RETRIES', YTDLP_RATE_LIMIT_MAX_RETRIES)
+YTDLP_RATE_LIMIT_BACKOFF_SECONDS = _env_float('MAI_YTDLP_RATE_LIMIT_BACKOFF', YTDLP_RATE_LIMIT_BACKOFF_SECONDS)
+YTDLP_RATE_LIMIT_MAX_BACKOFF_SECONDS = _env_float('MAI_YTDLP_RATE_LIMIT_MAX_BACKOFF', YTDLP_RATE_LIMIT_MAX_BACKOFF_SECONDS)
+YTDLP_MIN_REQUEST_INTERVAL_SECONDS = _env_float('MAI_YTDLP_MIN_REQUEST_INTERVAL', YTDLP_MIN_REQUEST_INTERVAL_SECONDS)
+YTDLP_GLOBAL_PAUSE_ON_429 = _env_int('MAI_YTDLP_GLOBAL_PAUSE_ON_429', 1) != 0
 
 SOURCE_TRACK_COLUMNS = [
     'video_id',
@@ -156,6 +196,50 @@ BASE_TRANSITION_COLUMNS = [
     'to_resolved_duration_seconds',
 ]
 
+# Compact export used for the training transitions CSV.
+# Keep high-signal transition metadata and textual context while dropping
+# bulky timing and dense numeric feature columns.
+COMPACT_TRANSITION_COLUMNS = [
+    'video_id',
+    'label',
+    'label_source',
+    'channel_handle',
+    'channel_url',
+    'video_title',
+    'video_url',
+    'from_position',
+    'to_position',
+    'transition_duration_s',
+    'from_track_raw',
+    'to_track_raw',
+    'from_artist_guess',
+    'from_title_guess',
+    'to_artist_guess',
+    'to_title_guess',
+    'from_track_source',
+    'to_track_source',
+    'from_video_id',
+    'to_video_id',
+    'from_resolved_title',
+    'from_resolved_artist',
+    'from_resolved_url',
+    'from_resolved_duration_seconds',
+    'to_resolved_title',
+    'to_resolved_artist',
+    'to_resolved_url',
+    'to_resolved_duration_seconds',
+    'from_uploader',
+    'to_uploader',
+    'from_channel',
+    'to_channel',
+    'from_category',
+    'to_category',
+    'from_tags',
+    'to_tags',
+    'from_description',
+    'to_description',
+]
+
 ANALYSIS_REQUIRED_COLUMNS = [
     'tempo',
     'key',
@@ -174,6 +258,44 @@ ANALYSIS_REQUIRED_DEEP_COLUMNS = [
 ]
 
 
+class SessionErrorCaptureHandler(logging.Handler):
+    def __init__(self, level: int = logging.WARNING):
+        super().__init__(level=level)
+        self._entries: list[dict[str, str]] = []
+        self._lock = Lock()
+
+    @property
+    def entries(self) -> list[dict[str, str]]:
+        with self._lock:
+            return list(self._entries)
+
+    @property
+    def warning_count(self) -> int:
+        with self._lock:
+            return sum(1 for entry in self._entries if entry.get('level') == 'WARNING')
+
+    @property
+    def error_count(self) -> int:
+        with self._lock:
+            return sum(1 for entry in self._entries if entry.get('level') in {'ERROR', 'CRITICAL'})
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < self.level:
+            return
+        try:
+            timestamp = datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S')
+            entry = {
+                'timestamp': timestamp,
+                'level': record.levelname,
+                'logger': record.name,
+                'message': record.getMessage(),
+            }
+            with self._lock:
+                self._entries.append(entry)
+        except Exception:  # pragma: no cover - avoid logging recursion
+            return
+
+
 def _emit_progress(
     progress_callback: ProgressCallback | None,
     label: str,
@@ -183,6 +305,137 @@ def _emit_progress(
 ) -> None:
     if progress_callback is not None:
         progress_callback(label, int(current), int(total), str(detail or ''))
+
+
+class _CapturingYtDlpLogger:
+    def __init__(self, base_logger: logging.Logger) -> None:
+        self._base_logger = base_logger
+        self.messages: list[str] = []
+
+    def debug(self, message: str) -> None:
+        self._base_logger.debug(str(message))
+
+    def info(self, message: str) -> None:
+        self._base_logger.info(str(message))
+
+    def warning(self, message: str) -> None:
+        payload = str(message)
+        self.messages.append(payload)
+        self._base_logger.warning(payload)
+
+    def error(self, message: str) -> None:
+        payload = str(message)
+        self.messages.append(payload)
+        self._base_logger.debug(payload)
+
+
+def _yt_dlp_wait_for_slot() -> None:
+    while True:
+        now = time.monotonic()
+        with _YTDLP_GLOBAL_RATE_LIMIT_LOCK:
+            global_until = _YTDLP_GLOBAL_RATE_LIMIT_UNTIL
+        if now < global_until:
+            time.sleep(max(0.0, global_until - now))
+            continue
+        break
+
+    interval = float(YTDLP_MIN_REQUEST_INTERVAL_SECONDS or 0.0)
+    if interval <= 0:
+        return
+    now = time.monotonic()
+    global _YTDLP_NEXT_REQUEST_AT
+    with _YTDLP_REQUEST_LOCK:
+        scheduled_at = max(_YTDLP_NEXT_REQUEST_AT, now)
+        with _YTDLP_GLOBAL_RATE_LIMIT_LOCK:
+            if _YTDLP_GLOBAL_RATE_LIMIT_UNTIL > scheduled_at:
+                scheduled_at = _YTDLP_GLOBAL_RATE_LIMIT_UNTIL
+        _YTDLP_NEXT_REQUEST_AT = scheduled_at + interval
+    sleep_for = scheduled_at - now
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+
+
+def _is_rate_limit_text(text: str) -> bool:
+    lowered = str(text or '').lower()
+    return 'http error 429' in lowered or 'too many requests' in lowered or 'rate limit' in lowered
+
+
+def _yt_dlp_log_indicates_rate_limit(messages: Sequence[str]) -> bool:
+    return any(_is_rate_limit_text(message) for message in messages)
+
+
+def _yt_dlp_exception_indicates_rate_limit(exc: Exception) -> bool:
+    return _is_rate_limit_text(str(exc))
+
+
+def _yt_dlp_backoff_delay(attempt: int) -> float:
+    base = max(float(YTDLP_RATE_LIMIT_BACKOFF_SECONDS or 0.0), 0.0)
+    if base <= 0:
+        return 0.0
+    delay = base * (2 ** max(int(attempt), 0))
+    return min(delay, float(YTDLP_RATE_LIMIT_MAX_BACKOFF_SECONDS or delay))
+
+
+def _sleep_for_rate_limit(attempt: int, *, context: str, total_attempts: int) -> None:
+    delay = _yt_dlp_backoff_delay(attempt)
+    if delay <= 0:
+        return
+    if YTDLP_GLOBAL_PAUSE_ON_429:
+        now = time.monotonic()
+        global_until = now + delay
+        with _YTDLP_GLOBAL_RATE_LIMIT_LOCK:
+            global _YTDLP_GLOBAL_RATE_LIMIT_UNTIL
+            if global_until > _YTDLP_GLOBAL_RATE_LIMIT_UNTIL:
+                _YTDLP_GLOBAL_RATE_LIMIT_UNTIL = global_until
+        with _YTDLP_REQUEST_LOCK:
+            global _YTDLP_NEXT_REQUEST_AT
+            if global_until > _YTDLP_NEXT_REQUEST_AT:
+                _YTDLP_NEXT_REQUEST_AT = global_until
+    suffix = f' ({context})' if context else ''
+    logger.warning(
+        'yt-dlp rate limit detected%s; backing off %.1fs before retry %d/%d',
+        suffix,
+        delay,
+        attempt + 1,
+        total_attempts,
+    )
+    time.sleep(delay)
+
+
+def _yt_dlp_extract_info(
+    url: str,
+    ydl_opts: dict[str, Any],
+    *,
+    allow_empty: bool,
+    context: str,
+) -> dict[str, Any]:
+    attempts = max(int(YTDLP_RATE_LIMIT_MAX_RETRIES or 1), 1)
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        _yt_dlp_wait_for_slot()
+        capture_logger = _CapturingYtDlpLogger(logger)
+        active_opts = dict(ydl_opts or {})
+        active_opts['logger'] = capture_logger
+        try:
+            with YoutubeDL(apply_yt_dlp_auth_options(active_opts)) as ydl:
+                payload = ydl.extract_info(url, download=False) or {}
+        except Exception as exc:  # pragma: no cover - depends on live network behavior
+            last_exc = exc
+            if _yt_dlp_exception_indicates_rate_limit(exc) and attempt < attempts - 1:
+                _sleep_for_rate_limit(attempt, context=context, total_attempts=attempts)
+                continue
+            raise
+        if payload:
+            return payload
+        if _yt_dlp_log_indicates_rate_limit(capture_logger.messages) and attempt < attempts - 1:
+            _sleep_for_rate_limit(attempt, context=context, total_attempts=attempts)
+            continue
+        if allow_empty:
+            return payload
+        last_exc = RuntimeError(f'yt-dlp returned no metadata for {context or url}')
+    if last_exc is not None:
+        raise last_exc
+    return {}
 
 
 def _worker_count(requested_workers: int, total_items: int) -> int:
@@ -212,6 +465,112 @@ def _add_bool_override(
     group = parser.add_mutually_exclusive_group()
     group.add_argument(true_flag, dest=dest, action='store_true', default=bool(default), help=true_help)
     group.add_argument(false_flag, dest=dest, action='store_false', help=false_help)
+
+
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    if int(denominator or 0) <= 0:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
+def _pct_text(numerator: int, denominator: int) -> str:
+    if int(denominator or 0) <= 0:
+        return 'n/a'
+    return f'{100.0 * _safe_ratio(numerator, denominator):.1f}%'
+
+
+def _default_errors_report_path(output_csv_path: str, run_started_at: datetime) -> str:
+    root, _ = os.path.splitext(output_csv_path)
+    timestamp = run_started_at.strftime('%Y%m%d_%H%M%S')
+    return f'{root}_errors_{timestamp}.log'
+
+
+def _write_session_errors_report(
+    path: str,
+    *,
+    entries: list[dict[str, str]],
+    run_started_at: datetime,
+    run_finished_at: datetime,
+    run_failed: bool,
+) -> None:
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    lines = [
+        'Mai Training Scrape Session Errors',
+        f'run_started={run_started_at.strftime("%Y-%m-%d %H:%M:%S")}',
+        f'run_finished={run_finished_at.strftime("%Y-%m-%d %H:%M:%S")}',
+        f'run_status={"failed" if run_failed else "success"}',
+        f'captured_entries={len(entries)}',
+        '',
+    ]
+    if entries:
+        lines.append('timestamp | level | logger | message')
+        for entry in entries:
+            lines.append(
+                f"{entry.get('timestamp', '')} | {entry.get('level', '')} | {entry.get('logger', '')} | {entry.get('message', '')}"
+            )
+    else:
+        lines.append('No warnings or errors were captured for this session.')
+    lines.append('')
+
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write('\n'.join(lines))
+
+
+def format_scrape_summary_report(
+    summary: dict[str, int],
+    *,
+    output_path: str,
+    errors_path: str,
+    warning_count: int,
+    error_count: int,
+) -> str:
+    channels_scanned = int(summary.get('channels_scanned', 0))
+    channels_failed = int(summary.get('channels_failed', 0))
+    videos_scanned = int(summary.get('videos_scanned', 0))
+    videos_with_tracklist = int(summary.get('videos_with_tracklist', 0))
+    videos_skipped = int(summary.get('videos_skipped', 0))
+    tracks_parsed = int(summary.get('tracks_parsed', 0))
+    tracks_resolved = int(summary.get('tracks_resolved', 0))
+    tracks_unresolved = int(summary.get('tracks_unresolved', 0))
+    tracks_unavailable = int(summary.get('tracks_unavailable', 0))
+    tracks_analyzed = int(summary.get('tracks_analyzed', 0))
+    tracks_with_features = int(summary.get('tracks_with_features', 0))
+    tracks_analysis_failed = int(summary.get('tracks_analysis_failed', 0))
+    positive_pairs = int(summary.get('positive_pairs', 0))
+    pairs_skipped = int(summary.get('pairs_skipped', 0))
+    total_pairs_considered = positive_pairs + pairs_skipped
+    analysis_denominator = tracks_resolved if tracks_resolved > 0 else tracks_analyzed
+
+    return '\n'.join([
+        'Training Scrape Report',
+        f'- Output CSV: {output_path}',
+        f'- Session Errors: {errors_path}',
+        (
+            f'- Sources: channels_scanned={channels_scanned} '
+            f'channels_failed={channels_failed} ({_pct_text(channels_failed, channels_scanned)})'
+        ),
+        (
+            f'- Videos: scanned={videos_scanned} with_tracklist={videos_with_tracklist} ({_pct_text(videos_with_tracklist, videos_scanned)}) '
+            f'skipped={videos_skipped} ({_pct_text(videos_skipped, videos_scanned)})'
+        ),
+        (
+            f'- Tracks: parsed={tracks_parsed} resolved={tracks_resolved} ({_pct_text(tracks_resolved, tracks_parsed)}) '
+            f'unresolved={tracks_unresolved} ({_pct_text(tracks_unresolved, tracks_parsed)}) '
+            f'unavailable={tracks_unavailable} ({_pct_text(tracks_unavailable, tracks_parsed)})'
+        ),
+        (
+            f'- Analysis: analyzed_unique={tracks_analyzed} with_features={tracks_with_features} ({_pct_text(tracks_with_features, analysis_denominator)}) '
+            f'analysis_failed={tracks_analysis_failed} ({_pct_text(tracks_analysis_failed, analysis_denominator)})'
+        ),
+        (
+            f'- Pairs: positive={positive_pairs} skipped={pairs_skipped} '
+            f'kept_rate={_pct_text(positive_pairs, total_pairs_considered)}'
+        ),
+        f'- Logged issues: warnings={warning_count} errors={error_count}',
+    ])
 
 
 def _seconds_to_timestamp(total_seconds: int) -> str:
@@ -1184,11 +1543,16 @@ def _search_youtube_track_candidates_once(
         'ignoreerrors': True,
         'socket_timeout': YTDLP_SOCKET_TIMEOUT_SECONDS,
         'extractor_retries': YTDLP_EXTRACTOR_RETRIES,
+        'extractor_args': {'youtube': {'player_skip': ['js']}},
     }
     if extract_flat is not None:
         ydl_opts['extract_flat'] = extract_flat
-    with YoutubeDL(apply_yt_dlp_auth_options(ydl_opts)) as ydl:
-        info = ydl.extract_info(search_query, download=False) or {}
+    info = _yt_dlp_extract_info(
+        search_query,
+        ydl_opts,
+        allow_empty=True,
+        context=f'search "{query}"',
+    )
     return _extract_search_entries(info)
 
 
@@ -1535,9 +1899,14 @@ def fetch_channel_video_entries(
             'ignoreerrors': True,
             'socket_timeout': YTDLP_SOCKET_TIMEOUT_SECONDS,
             'extractor_retries': YTDLP_EXTRACTOR_RETRIES,
+            'extractor_args': {'youtube': {'player_skip': ['js']}},
         }
-        with YoutubeDL(apply_yt_dlp_auth_options(ydl_opts)) as ydl:
-            info = ydl.extract_info(channel_url, download=False) or {}
+        info = _yt_dlp_extract_info(
+            channel_url,
+            ydl_opts,
+            allow_empty=False,
+            context=f'channel {channel_url}',
+        )
         if not info:
             raise RuntimeError(f'yt-dlp returned no channel metadata for {channel_url}')
         payload = {
@@ -1584,9 +1953,14 @@ def fetch_video_metadata(
         'ignoreerrors': True,
         'socket_timeout': YTDLP_SOCKET_TIMEOUT_SECONDS,
         'extractor_retries': YTDLP_EXTRACTOR_RETRIES,
+        'extractor_args': {'youtube': {'player_skip': ['js']}},
     }
-    with YoutubeDL(apply_yt_dlp_auth_options(ydl_opts)) as ydl:
-        metadata = ydl.extract_info(video_url, download=False) or {}
+    metadata = _yt_dlp_extract_info(
+        video_url,
+        ydl_opts,
+        allow_empty=False,
+        context=f'video {video_id}',
+    )
     if not metadata:
         raise RuntimeError(f'yt-dlp returned no video metadata for {video_id}')
     compacted_metadata = _compact_video_metadata(metadata)
@@ -1695,26 +2069,50 @@ def _enrich_resolved_tracks_with_metadata(
                 )
                 future_map[future] = row
             completed = 0
-            for future in as_completed(future_map):
-                completed += 1
-                row = future_map[future]
-                video_id = str(row.get('video_id') or '').strip()
-                try:
-                    resolved_video_id, payload = future.result()
-                except Exception as exc:  # pragma: no cover - depends on live network behavior
-                    logger.warning('Failed to fetch resolved track metadata for %s: %s', video_id, exc)
-                    payload = {
-                        'title': str(row.get('title') or '').strip(),
-                        'artist': str(row.get('artist') or '').strip(),
-                        'uploader': str(row.get('artist') or '').strip(),
-                        'channel': str(row.get('artist') or '').strip(),
-                        'description': '',
-                        'tags': '',
-                        'category': '',
-                        'url': str(row.get('url') or normalize_video_url(video_id)).strip(),
-                    }
-                    resolved_video_id = video_id
-                _store_result(resolved_video_id, payload, completed)
+            pending_futures = set(future_map)
+            while pending_futures:
+                done_futures, pending_futures = wait(
+                    pending_futures,
+                    timeout=FUTURE_WAIT_HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_futures:
+                    waiting_ids = sorted(
+                        str((future_map[future] or {}).get('video_id') or '').strip()
+                        for future in pending_futures
+                    )
+                    preview = ', '.join(video_id for video_id in waiting_ids[:3] if video_id)
+                    if len(waiting_ids) > 3:
+                        preview = f'{preview}, +{len(waiting_ids) - 3} more' if preview else f'+{len(waiting_ids) - 3} more'
+                    _emit_progress(
+                        progress_callback,
+                        'Fetching resolved track metadata',
+                        completed,
+                        max(total_tracks, 1),
+                        f'waiting on {len(pending_futures)} metadata lookups' + (f' ({preview})' if preview else ''),
+                    )
+                    continue
+
+                for future in done_futures:
+                    completed += 1
+                    row = future_map[future]
+                    video_id = str(row.get('video_id') or '').strip()
+                    try:
+                        resolved_video_id, payload = future.result()
+                    except Exception as exc:  # pragma: no cover - depends on live network behavior
+                        logger.warning('Failed to fetch resolved track metadata for %s: %s', video_id, exc)
+                        payload = {
+                            'title': str(row.get('title') or '').strip(),
+                            'artist': str(row.get('artist') or '').strip(),
+                            'uploader': str(row.get('artist') or '').strip(),
+                            'channel': str(row.get('artist') or '').strip(),
+                            'description': '',
+                            'tags': '',
+                            'category': '',
+                            'url': str(row.get('url') or normalize_video_url(video_id)).strip(),
+                        }
+                        resolved_video_id = video_id
+                    _store_result(resolved_video_id, payload, completed)
 
     enriched_df = unique_tracks.copy()
     for column in ['title', 'artist', 'uploader', 'channel', 'description', 'tags', 'category', 'url']:
@@ -1868,12 +2266,39 @@ def scrape_channel_track_rows(
                     )
                     future_map[future] = (video_number, video)
                 iterator = []
-                for future in as_completed(future_map):
-                    video_number, video = future_map[future]
-                    try:
-                        iterator.append((video_number, video, future.result(), None))
-                    except Exception as exc:  # pragma: no cover - depends on live network behavior
-                        iterator.append((video_number, video, None, exc))
+                pending_futures = set(future_map)
+                while pending_futures:
+                    done_futures, pending_futures = wait(
+                        pending_futures,
+                        timeout=FUTURE_WAIT_HEARTBEAT_SECONDS,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done_futures:
+                        waiting_ids = sorted(
+                            str((future_map[future][1] or {}).get('video_id') or '').strip()
+                            for future in pending_futures
+                        )
+                        preview = ', '.join(video_id for video_id in waiting_ids[:3] if video_id)
+                        if len(waiting_ids) > 3:
+                            preview = f'{preview}, +{len(waiting_ids) - 3} more' if preview else f'+{len(waiting_ids) - 3} more'
+                        _emit_progress(
+                            progress_callback,
+                            'Scraping source videos',
+                            total_videos - len(pending_videos),
+                            max(total_videos, 1),
+                            (
+                                f'waiting on {len(pending_futures)} metadata fetches'
+                                + (f' ({preview})' if preview else '')
+                            ),
+                        )
+                        continue
+
+                    for future in done_futures:
+                        video_number, video = future_map[future]
+                        try:
+                            iterator.append((video_number, video, future.result(), None))
+                        except Exception as exc:  # pragma: no cover - depends on live network behavior
+                            iterator.append((video_number, video, None, exc))
             finally:
                 executor.shutdown(wait=True)
 
@@ -2218,6 +2643,7 @@ def analyze_resolved_tracks(
     resource_profile: str = 'default',
     refresh_cache: bool = False,
     delete_audio_after_analysis: bool = True,
+    reuse_cache_any_signature: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     if track_df.empty:
@@ -2272,6 +2698,7 @@ def analyze_resolved_tracks(
         download_workers=download_workers,
         analysis_workers=analysis_workers,
         delete_audio_after_analysis=delete_audio_after_analysis,
+        reuse_cache_any_signature=reuse_cache_any_signature,
         progress_callback=progress_callback,
     ).rename(columns={'video_id': 'resolved_video_id'})
     _emit_progress(progress_callback, 'Analyzing resolved tracks', len(unique_tracks), max(len(unique_tracks), 1), 'audio analysis complete')
@@ -2546,6 +2973,7 @@ def scrape_training_transitions(
         resource_profile=resource_profile,
         refresh_cache=refresh_cache,
         delete_audio_after_analysis=delete_audio_after_analysis,
+        reuse_cache_any_signature=True,
         progress_callback=progress_callback,
     )
     training_df, pair_summary = build_training_transition_rows(
@@ -2604,9 +3032,50 @@ def write_training_transitions_csv(df: pd.DataFrame, out_path: str) -> None:
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     if df.empty:
-        pd.DataFrame(columns=BASE_TRANSITION_COLUMNS).to_csv(out_path, index=False, encoding='utf-8')
+        pd.DataFrame(columns=COMPACT_TRANSITION_COLUMNS).to_csv(out_path, index=False, encoding='utf-8')
         return
-    df.reindex(columns=_ordered_transition_columns(df)).to_csv(out_path, index=False, encoding='utf-8')
+    prepared = _sanitize_transition_export_text(df)
+    prepared = _compact_transition_export_columns(prepared)
+    prepared.to_csv(out_path, index=False, encoding='utf-8')
+
+
+def _compact_transition_export_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.reindex(columns=COMPACT_TRANSITION_COLUMNS)
+    present = [column for column in COMPACT_TRANSITION_COLUMNS if column in df.columns]
+    return df.reindex(columns=present)
+
+
+def _sanitize_transition_export_text(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    prepared = df.copy()
+    description_columns = [column for column in prepared.columns if column == 'description' or column.endswith('_description')]
+    for column in description_columns:
+        prepared[column] = prepared[column].map(_flatten_multiline_export_text)
+    return prepared
+
+
+def _flatten_multiline_export_text(value: Any) -> str:
+    if value is None:
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+    except TypeError:
+        pass
+
+    text = str(value).replace('\r\n', '\n').replace('\r', '\n')
+    if not text:
+        return ''
+
+    # Keep description payload single-line in CSV output while preserving paragraph boundaries.
+    flattened_lines = [
+        ' '.join(line.split())
+        for line in text.split('\n')
+        if line.strip()
+    ]
+    return ' | '.join(flattened_lines).strip()
 
 
 def build_parser(config: dict, config_path: str, no_config: bool) -> argparse.ArgumentParser:
@@ -2617,6 +3086,7 @@ def build_parser(config: dict, config_path: str, no_config: bool) -> argparse.Ar
     parser.add_argument('--no-config', action='store_true', default=no_config, help='Ignore the TOML config and use CLI/default values only')
     parser.add_argument('--channel-url', default=None, help='Single channel videos URL to scrape instead of the configured channel list')
     parser.add_argument('--out', default=get_config_value(config, 'training.output_path', DEFAULT_OUTPUT_PATH), help='Output CSV path')
+    parser.add_argument('--errors-out', default=get_config_value(config, 'training.errors_path', ''), help='Path for per-session warning/error report; defaults to a timestamped file next to --out')
     parser.add_argument('--max-videos', type=int, default=get_config_value(config, 'training.max_videos', None), help='Limit the number of source videos scraped per channel')
     parser.add_argument('--max-search-results', type=int, default=int(get_config_value(config, 'training.max_search_results', MAX_SEARCH_RESULTS)), help='Number of YouTube search candidates to inspect for each scraped track')
     parser.add_argument('--metadata-workers', type=int, default=int(get_config_value(config, 'training.metadata_workers', DEFAULT_METADATA_WORKERS)), help='Concurrent worker count for source-video metadata fetches')
@@ -2658,6 +3128,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     configure_cli_logging(getattr(logging, args.log_level))
     progress = CliProgressRenderer()
+    run_started_at = datetime.now()
+    summary: dict[str, int] = {}
+    run_failed = False
+    errors_report_path = str(args.errors_out or '').strip() or _default_errors_report_path(args.out, run_started_at)
+    session_error_capture = SessionErrorCaptureHandler(level=logging.WARNING)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(session_error_capture)
     try:
         channels = resolve_training_sources(config, channel_url=args.channel_url)
         progress.section('Training scrape', f'{len(channels)} source(s) -> {args.out}')
@@ -2691,24 +3168,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"{summary.get('positive_pairs', 0)} positive pairs from {summary.get('videos_with_tracklist', 0)} source videos",
         )
         print('Wrote training transition CSV to', args.out)
-        print(
-            'Scrape summary: '
-            f"channels_scanned={summary.get('channels_scanned', 0)} "
-            f"videos_scanned={summary.get('videos_scanned', 0)} "
-            f"videos_with_tracklist={summary.get('videos_with_tracklist', 0)} "
-            f"videos_skipped={summary.get('videos_skipped', 0)} "
-            f"tracks_parsed={summary.get('tracks_parsed', 0)} "
-            f"tracks_resolved={summary.get('tracks_resolved', 0)} "
-            f"tracks_unresolved={summary.get('tracks_unresolved', 0)} "
-            f"tracks_unavailable={summary.get('tracks_unavailable', 0)} "
-            f"tracks_analyzed={summary.get('tracks_analyzed', 0)} "
-            f"tracks_with_features={summary.get('tracks_with_features', 0)} "
-            f"tracks_analysis_failed={summary.get('tracks_analysis_failed', 0)} "
-            f"positive_pairs={summary.get('positive_pairs', 0)} "
-            f"pairs_skipped={summary.get('pairs_skipped', 0)}"
-        )
+        print(format_scrape_summary_report(
+            summary,
+            output_path=args.out,
+            errors_path=errors_report_path,
+            warning_count=session_error_capture.warning_count,
+            error_count=session_error_capture.error_count,
+        ))
+    except Exception:
+        run_failed = True
+        logger.exception('Training scrape failed')
+        raise
     finally:
-        progress.close()
+        run_finished_at = datetime.now()
+        errors_report_written = False
+        try:
+            _write_session_errors_report(
+                errors_report_path,
+                entries=session_error_capture.entries,
+                run_started_at=run_started_at,
+                run_finished_at=run_finished_at,
+                run_failed=run_failed,
+            )
+            errors_report_written = True
+        except Exception as exc:  # pragma: no cover - disk/io dependent
+            print(f'Failed to write session errors report to {errors_report_path}: {exc}')
+        finally:
+            root_logger.removeHandler(session_error_capture)
+            progress.close()
+        if errors_report_written:
+            print('Wrote session errors report to', errors_report_path)
 
 
 if __name__ == '__main__':

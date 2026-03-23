@@ -542,6 +542,17 @@ def _build_feature_cache_lookup(cache_df: pd.DataFrame) -> dict[tuple[str, str],
     }
 
 
+def _build_feature_cache_fallback_lookup(cache_df: pd.DataFrame) -> dict[str, dict]:
+    prepared_cache_df = _prepare_feature_cache_table(cache_df)
+    if prepared_cache_df.empty:
+        return {}
+    deduped = prepared_cache_df.drop_duplicates(subset=[_FEATURE_CACHE_KEY_COLUMN], keep='last')
+    return {
+        str(row[_FEATURE_CACHE_KEY_COLUMN]).strip(): _cached_features_from_row(row)
+        for row in deduped.to_dict(orient='records')
+    }
+
+
 def _lookup_feature_cache_row(
     cache_df: pd.DataFrame | dict[tuple[str, str], dict],
     video_id: str,
@@ -832,7 +843,7 @@ def _compute_features(y: np.ndarray, sr: int, prefix: str = '') -> dict:
     chroma_mean = chroma.mean(axis=1)
     key, mode = _estimate_key_kk(chroma_mean)
 
-    # A few compact timbre descriptors; keep it small but useful for transitions.
+    # A few compact timbre descriptors
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
     mfcc_mean = mfcc.mean(axis=1)
 
@@ -945,20 +956,13 @@ def download_youtube_audio(url: str, video_id: str, audio_cache_dir: str) -> str
     if os.path.exists(preferred):
         return preferred
     existing = glob.glob(os.path.join(audio_cache_dir, f'{video_id}.*'))
-    # If we have older non-wav cache entries (webm/m4a), re-download and convert to wav.
-    for path in existing:
-        try:
-            if not path.lower().endswith('.wav'):
-                os.remove(path)
-        except OSError:
-            pass
 
     output_template = os.path.join(audio_cache_dir, f'{video_id}.%(ext)s')
     ffmpeg_location = _ensure_ffmpeg_dir(cache_root=os.path.dirname(audio_cache_dir))
     logger.debug('download_youtube_audio video_id=%s ffmpeg_location=%s', video_id, ffmpeg_location)
 
-    # For analysis we don't need pristine audio; prefer smaller streams and be aggressive about retries.
-    # Many "skips" are just transient googlevideo timeouts.
+    # Prefer smaller streams and be aggressive about retries
+    # Many skips are just transient googlevideo timeouts
     base_ydl_opts = {
         'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': output_template,
@@ -971,9 +975,9 @@ def download_youtube_audio(url: str, video_id: str, audio_cache_dir: str) -> str
         'fragment_retries': 10,
         'http_chunk_size': 1024 * 1024,
         'concurrent_fragment_downloads': 1,
-        # IPv6 can be flaky in some environments; forcing IPv4 avoids lots of timeouts.
+        # Forcing IPv4
         'source_address': '0.0.0.0',
-        # Convert to a SoundFile-friendly format so librosa doesn't need audioread/ffmpeg.
+        # Convert to a SoundFile-friendly format so librosa doesn't need audioread/ffmpeg
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'wav',
@@ -986,7 +990,7 @@ def download_youtube_audio(url: str, video_id: str, audio_cache_dir: str) -> str
     last_exc: Optional[Exception] = None
     for attempt in range(1, 4):
         try:
-            # Backoff before retries to avoid hammering the same failing edge.
+            # Backoff before retries
             if attempt > 1:
                 time.sleep(min(30, 2 ** attempt))
             with YoutubeDL(apply_yt_dlp_auth_options(base_ydl_opts)) as ydl:
@@ -1349,6 +1353,7 @@ def analyze_youtube_playlist_audio(
     download_workers: int = 1,
     analysis_workers: int = 1,
     delete_audio_after_analysis: bool = True,
+    reuse_cache_any_signature: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
     resource_settings = _resolve_analysis_resource_settings(
@@ -1371,6 +1376,10 @@ def analyze_youtube_playlist_audio(
     registry_rows = []
     feature_cache_df, feature_cache_csv_path = _load_feature_cache_table(feature_cache_dir)
     feature_cache_lookup = _build_feature_cache_lookup(feature_cache_df)
+    fallback_cache_lookup = (
+        _build_feature_cache_fallback_lookup(feature_cache_df)
+        if reuse_cache_any_signature and not refresh_cache else {}
+    )
     working_df = df.iloc[:int(max_tracks)].copy() if max_tracks is not None else df.copy()
     total = int(len(working_df))
     analyzed = 0
@@ -1422,6 +1431,26 @@ def analyze_youtube_playlist_audio(
                     f'{_task_progress_detail(normalized_video_id, _metadata_from_row(row, url_col=url_col))} audio cache hit',
                 )
                 continue
+            if fallback_cache_lookup:
+                fallback_features = fallback_cache_lookup.get(normalized_video_id)
+                if fallback_features and _row_has_audio_features(pd.Series(fallback_features), flow_profile=flow_profile):
+                    logger.debug(
+                        'using cached feature row for %s with mismatched settings from %s',
+                        normalized_video_id,
+                        feature_cache_csv_path,
+                    )
+                    cached_row = dict(fallback_features)
+                    cached_row[id_col] = video_id
+                    registry_rows.append(cached_row)
+                    reused_from_cache += 1
+                    _emit_progress(
+                        progress_callback,
+                        'Scanning audio cache',
+                        row_number,
+                        max(total, 1),
+                        f'{_task_progress_detail(normalized_video_id, _metadata_from_row(row, url_col=url_col))} audio cache hit (legacy)',
+                    )
+                    continue
         url = str(row.get(url_col) or f'https://www.youtube.com/watch?v={video_id}')
         metadata = _metadata_from_row(row, url_col=url_col)
         task = pending_tasks.get(normalized_video_id)
