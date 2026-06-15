@@ -4,6 +4,9 @@ Transition-aware playlist tools for YouTube: reorder existing playlists, generat
 ## Current Capabilities
 - Pull a public YouTube playlist (metadata only) or read a CSV, normalize columns, and enrich with audio sentiment, key, tempo, and edge-intro/outro features.
 - Score directed transitions and generate either a single reordered playlist or multiple fixed-size playlists with beam search, genre balancing, and optional reuse controls.
+- Score handoffs with harmonic (Camelot/circle-of-fifths) compatibility, octave-aware tempo lock, beat/phrase alignment, and a cross-genre mood bridge so different genres flow seamlessly.
+- Train a supervised transition model (hard-negative mining + musical interaction features, cross-validated AUC) and a set-level arc model with `python -m mai.train`.
+- Refine ordering past beam search with a bounded 2-opt sweep and energy-arc orientation for near-optimal, narrative sets.
 - Export the recommended order to YouTube Music or standard YouTube playlists.
 - Scrape channel and video tracklists into labeled positive transitions, resolve tracks via search, analyze audio, and produce training pairs.
 - Reusable caches for playlist metadata, audio features, search resolution, and training artifacts, plus a cleanup command.
@@ -56,6 +59,24 @@ Remove stale audio/temp/yt-dlp cache files:
 python -m mai.cache_cleanup --dry-run
 python -m mai.cache_cleanup            # actually deletes
 ```
+
+## Models and training
+Mai blends hand-built transition components with two learned models. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and the rationale behind each modelling choice, and [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the end-to-end pipeline.
+
+Train both models from a scraped positive-transitions CSV:
+```powershell
+python -m mai.train --train-csv data/training/positive_transitions.csv
+```
+Outputs `data/cache/transition_model.joblib` (pairwise) and `data/cache/arc_model.joblib` (set-level arc). The transition model uses hard-negative mining (close-but-unchosen alternatives) and Camelot/tempo/mood interaction features, and prints a cross-validated AUC so you can judge data quality before generating. Key flags: `--negative-ratio`, `--hard-fraction`, `--device {cuda,cpu,auto}`, `--arc-profile {rise_peak_cool,rise,plateau,cool_down}`, `--skip-arc-model`.
+
+Use a trained model when generating:
+```powershell
+python run.py --csv data/Playlist.csv --transition-model-path data/cache/transition_model.joblib --transition-model-weight 0.35
+```
+
+Optional ML acceleration: install `torch` (GPU transition model + learned arc GRU) and, for cross-modal grounding, `transformers` with `MAI_AUDIO_ENCODER` / `MAI_CLAP_MODEL` set. Without them the descriptor representation, RandomForest scorer, and heuristic arc fit run as the always-on baseline.
+
+Scrape precision is tunable via `MAI_RESOLUTION_MIN_SCORE`, `MAI_RESOLUTION_LOW_OVERLAP_MIN_OVERLAP`, and `MAI_RESOLUTION_LOW_OVERLAP_MIN_SCORE`.
 
 ## Caches and Outputs
 - Playlist metadata cache: `data/cache/youtube_playlists/*.csv`.

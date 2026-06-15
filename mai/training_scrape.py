@@ -98,6 +98,13 @@ YTDLP_RATE_LIMIT_MAX_BACKOFF_SECONDS = _env_float('MAI_YTDLP_RATE_LIMIT_MAX_BACK
 YTDLP_MIN_REQUEST_INTERVAL_SECONDS = _env_float('MAI_YTDLP_MIN_REQUEST_INTERVAL', YTDLP_MIN_REQUEST_INTERVAL_SECONDS)
 YTDLP_GLOBAL_PAUSE_ON_429 = _env_int('MAI_YTDLP_GLOBAL_PAUSE_ON_429', 1) != 0
 
+# Resolution acceptance gate. Tightening these raises training-data precision
+# (fewer wrong song matches) at the cost of recall. Defaults preserve prior
+# behaviour; raise via env for a cleaner positive-transition set.
+RESOLUTION_MIN_SCORE = _env_float('MAI_RESOLUTION_MIN_SCORE', 1.05)
+RESOLUTION_LOW_OVERLAP_MIN_OVERLAP = _env_float('MAI_RESOLUTION_LOW_OVERLAP_MIN_OVERLAP', 0.5)
+RESOLUTION_LOW_OVERLAP_MIN_SCORE = _env_float('MAI_RESOLUTION_LOW_OVERLAP_MIN_SCORE', 1.45)
+
 SOURCE_TRACK_COLUMNS = [
     'video_id',
     'channel_url',
@@ -1687,7 +1694,10 @@ def _select_track_candidate_with_status(
             ranked_candidates.append((score, overlap, duration_rank, candidate))
         ranked_candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
         best_score, best_overlap, _, selected = ranked_candidates[0]
-        if best_score < 1.05 or (best_overlap < 0.5 and best_score < 1.45):
+        if best_score < RESOLUTION_MIN_SCORE or (
+            best_overlap < RESOLUTION_LOW_OVERLAP_MIN_OVERLAP
+            and best_score < RESOLUTION_LOW_OVERLAP_MIN_SCORE
+        ):
             return ('no_match', None)
     else:
         short_form = []

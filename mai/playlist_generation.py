@@ -7,8 +7,11 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import RobustScaler
 
+from .beat_align import phrase_alignment_matrix
+from .cross_modal import cross_genre_bridge_matrix
 from .genre import GENRE_SOURCE_MIN_CONFIDENCE, resolve_genres
 from .sentiment import SENTIMENT_DIMS, add_sentiment_features
+from .sequence_model import ArcModelArtifact, arc_fit, score_ordering
 from .transition_model import TransitionModelArtifact, score_transition_matrix as score_transition_model_matrix
 from .tonal import kk_key_transition_similarity
 
@@ -45,12 +48,14 @@ STRUCTURE_REQUIRED = [
     'outro_chroma_stability',
 ]
 TRANSITION_COMPONENT_WEIGHTS = {
-    'edge_flow_score': 0.30,
-    'structure_cadence_score': 0.20,
-    'timbre_score': 0.20,
-    'groove_score': 0.10,
-    'sentiment_score': 0.10,
+    'edge_flow_score': 0.26,
+    'structure_cadence_score': 0.16,
+    'timbre_score': 0.16,
+    'groove_score': 0.08,
+    'sentiment_score': 0.08,
     'tonal_score': 0.10,
+    'beat_phrase_score': 0.10,
+    'cross_genre_bridge_score': 0.06,
 }
 RESOLVED_GENRE_COLUMNS = ['style_cluster', 'genre_primary', 'genre_confidence', 'genre_source', 'mix_group']
 TITLE_CANDIDATE_COLUMNS = ['title', 'track_name', 'name', 'video_title']
@@ -208,6 +213,78 @@ def _path_transition_scores(path: list[int], transition_scores: np.ndarray) -> l
     if len(path) <= 1:
         return []
     return [float(transition_scores[path[index], path[index + 1]]) for index in range(len(path) - 1)]
+
+
+def _path_flow_sum(path: list[int], transition_scores: np.ndarray) -> float:
+    if len(path) <= 1:
+        return 0.0
+    return float(sum(transition_scores[path[index], path[index + 1]] for index in range(len(path) - 1)))
+
+
+def _path_flow_mean(path: list[int], transition_scores: np.ndarray) -> float:
+    if len(path) <= 1:
+        return 0.0
+    return _path_flow_sum(path, transition_scores) / float(len(path) - 1)
+
+
+def _two_opt_refine(
+    path: list[int],
+    transition_scores: np.ndarray,
+    max_passes: int = 6,
+    max_length: int = 160,
+) -> list[int]:
+    """Improve a directed ordering by reversing segments to raise total flow.
+
+    Beam search is greedy-with-lookahead and can leave locally bad sub-orderings;
+    a bounded 2-opt sweep recovers most of that gap. Skipped for very long paths
+    to keep runtime in check.
+    """
+    if len(path) < 4:
+        return list(path)
+    if len(path) > max_length:
+        logger.info('Skipping 2-opt refinement for length %d (> %d) to bound runtime.', len(path), max_length)
+        return list(path)
+
+    best = list(path)
+    best_flow = _path_flow_sum(best, transition_scores)
+    for _ in range(max(int(max_passes), 0)):
+        improved = False
+        length = len(best)
+        for i in range(length - 1):
+            for j in range(i + 1, length):
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                flow = _path_flow_sum(candidate, transition_scores)
+                if flow > best_flow + 1e-9:
+                    best, best_flow = candidate, flow
+                    improved = True
+        if not improved:
+            break
+    return best
+
+
+def _orient_for_arc(
+    path: list[int],
+    transition_scores: np.ndarray,
+    df: pd.DataFrame,
+    arc_model: ArcModelArtifact | None,
+    arc_weight: float,
+) -> list[int]:
+    """Pick the path orientation that best fits the target energy arc.
+
+    Flow quality is direction-sensitive, so we only compare the path against its
+    reverse (not arbitrary re-shuffles) and choose whichever blends the higher
+    flow with the better arc fit.
+    """
+    if len(path) < 3 or arc_weight <= 0:
+        return path
+    reverse = path[::-1]
+
+    def objective(candidate: list[int]) -> float:
+        flow = _path_flow_mean(candidate, transition_scores)
+        arc = score_ordering(arc_model, df, candidate) if arc_model is not None else arc_fit(df, candidate)
+        return flow + float(arc_weight) * arc
+
+    return reverse if objective(reverse) > objective(path) else path
 
 
 def _sort_key_series(df: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
@@ -474,7 +551,7 @@ def compute_transition_scores(
     if transition_model_weight < 0:
         raise ValueError('transition_model_weight must be non-negative')
     model_enabled = transition_model is not None and transition_model_weight > 0
-    total_steps = 8 + (1 if model_enabled else 0)
+    total_steps = 10 + (1 if model_enabled else 0)
     df = add_sentiment_features(df)
     _emit_progress(progress_callback, 'Transition scoring', 1, total_steps, 'prepared sentiment features')
     components: list[tuple[str, np.ndarray, float]] = []
@@ -538,15 +615,31 @@ def compute_transition_scores(
     components.append(('tonal_score', key_flow.astype(np.float32), TRANSITION_COMPONENT_WEIGHTS['tonal_score']))
     _emit_progress(progress_callback, 'Transition scoring', 7, total_steps, 'tonal')
 
+    beat_phrase = phrase_alignment_matrix(df)
+    if beat_phrase is not None:
+        logger.info('Transition scoring: beat/phrase alignment component.')
+        components.append(('beat_phrase_score', beat_phrase, TRANSITION_COMPONENT_WEIGHTS['beat_phrase_score']))
+        _emit_progress(progress_callback, 'Transition scoring', 8, total_steps, 'beat/phrase alignment')
+    else:
+        _emit_progress(progress_callback, 'Transition scoring', 8, total_steps, 'beat/phrase alignment skipped')
+
+    cross_genre_bridge = cross_genre_bridge_matrix(df)
+    if cross_genre_bridge is not None:
+        logger.info('Transition scoring: cross-genre mood-bridge component.')
+        components.append(('cross_genre_bridge_score', cross_genre_bridge, TRANSITION_COMPONENT_WEIGHTS['cross_genre_bridge_score']))
+        _emit_progress(progress_callback, 'Transition scoring', 9, total_steps, 'cross-genre mood bridge')
+    else:
+        _emit_progress(progress_callback, 'Transition scoring', 9, total_steps, 'cross-genre mood bridge skipped')
+
     if model_enabled:
         try:
             model_flow = score_transition_model_matrix(transition_model, df)
             logger.info('Transition scoring: trained transition model component.')
             components.append(('transition_model_score', model_flow.astype(np.float32), float(transition_model_weight)))
-            _emit_progress(progress_callback, 'Transition scoring', 8, total_steps, 'trained transition model')
+            _emit_progress(progress_callback, 'Transition scoring', 10, total_steps, 'trained transition model')
         except Exception:
             logger.exception('Transition scoring: trained transition model component failed; continuing without it.')
-            _emit_progress(progress_callback, 'Transition scoring', 8, total_steps, 'trained transition model skipped')
+            _emit_progress(progress_callback, 'Transition scoring', 10, total_steps, 'trained transition model skipped')
     elif transition_model_weight > 0:
         logger.info('Transition scoring: trained transition model component skipped (no model provided).')
 
@@ -688,11 +781,14 @@ def _beam_search_playlist(
             candidates = [index for index in available_indices if index not in used]
             if not candidates:
                 continue
-            ranked = sorted(
-                candidates,
-                key=lambda candidate: transition_scores[last_index, candidate],
-                reverse=True,
-            )[:candidate_width]
+            candidate_array = np.asarray(candidates)
+            candidate_scores = transition_scores[last_index, candidate_array]
+            if candidate_array.size > candidate_width:
+                top = np.argpartition(candidate_scores, -candidate_width)[-candidate_width:]
+                order = top[np.argsort(candidate_scores[top])[::-1]]
+            else:
+                order = np.argsort(candidate_scores)[::-1]
+            ranked = candidate_array[order].tolist()
             for candidate in ranked:
                 delta = _path_delta(
                     last_index,
@@ -747,9 +843,17 @@ def generate_playlist_paths(
     beam_width: int = 8,
     candidate_width: int = 25,
     allow_reuse: bool = False,
+    arc_model: ArcModelArtifact | None = None,
+    arc_weight: float = 0.12,
+    refine_iterations: int = 6,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[list[int]], pd.DataFrame, str]:
-    """Generate one or more optimized playlists from a large pool."""
+    """Generate one or more optimized playlists from a large pool.
+
+    After beam search, each playlist is refined with a bounded 2-opt sweep
+    (raising total flow) and oriented to best fit the target energy arc, giving a
+    closer-to-optimal global order without the cost of exhaustive search.
+    """
     if playlist_size <= 0:
         raise ValueError('playlist_size must be positive')
     if beam_width <= 0 or candidate_width <= 0:
@@ -803,6 +907,9 @@ def generate_playlist_paths(
             progress_label=progress_label,
             progress_callback=progress_callback,
         )
+        if refine_iterations > 0:
+            path = _two_opt_refine(path, transition_scores, max_passes=refine_iterations)
+        path = _orient_for_arc(path, transition_scores, df, arc_model, arc_weight)
         paths.append(path)
         global_used.update(path)
         global_mix_usage.update(mix_groups[index] for index in path)
