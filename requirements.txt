@@ -12,3 +12,9 @@ google-api-python-client
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
+
+# Optional ML acceleration (not required for the default RandomForest + heuristic path):
+#   torch          -> GPU transition model and the learned arc-sequence GRU
+#   transformers   -> pretrained MERT/CLAP encoders (set MAI_AUDIO_ENCODER / MAI_CLAP_MODEL)
+# torch
+# transformers

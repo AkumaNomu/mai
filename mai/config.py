@@ -39,6 +39,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         'rate_transitions': False,
         'transition_report_out': '',
         'print_recommended_order': False,
+        'refine_iterations': 6,
+        'arc_weight': 0.12,
+        'arc_profile': 'rise_peak_cool',
+        'arc_model_path': '',
     },
     'training': {
         'output_path': 'data/training/positive_transitions.csv',
@@ -48,6 +52,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         'search_workers': 4,
         'label': 'excellent',
         'label_source': 'youtube_mix_curation',
+        'transition_model_hard_fraction': 0.8,
+        'transition_model_negative_ratio': 1.0,
+        'transition_model_backend': 'auto',
+        'arc_model_path': 'data/cache/arc_model.joblib',
+        'arc_profile': 'rise_peak_cool',
         'videos': [],
         'channels': [
             {
