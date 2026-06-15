@@ -8,10 +8,18 @@ The always-on model is an energy/arousal *arc fit*: a playlist's mood curve is
 compared against a target arc (rise -> peak -> cool-down by default). It needs no
 training and is used to refine ordering after the transition-driven search.
 
-The learned model is an optional sequence classifier (a small GRU over track
-embeddings) trained on real DJ mix orderings versus shuffled ones, so it learns
-what a *real* progression looks like. It activates only when PyTorch is present;
-otherwise the arc fit is authoritative.
+The learned model has two tiers, both trained on real DJ mix orderings versus
+shuffled ones so they learn what a *real* progression looks like:
+
+* A torch-free **order classifier** (logistic regression over a handful of
+  order-summary features). It is the always-on learned tier and is deliberately
+  low-data: a few scraped mixes, each contrasted against many shuffles, are
+  enough because the feature space is tiny. This is the practical answer to
+  "learn from playlist *order*, not labelled pairs" when data is scarce.
+* An optional **GRU** over track embeddings, used only when PyTorch is present
+  *and* there are enough reconstructable mixes to justify it.
+
+When neither can be trained the arc fit is authoritative.
 """
 
 from __future__ import annotations
@@ -24,6 +32,10 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from .embeddings import compute_track_embeddings
 from .sentiment import add_sentiment_features
@@ -32,6 +44,12 @@ from .sentiment import add_sentiment_features
 logger = logging.getLogger(__name__)
 
 DEFAULT_ARC_MODEL_PATH = os.path.join('data', 'cache', 'arc_model.joblib')
+
+# Torch-free order classifier: minimum mixes to attempt it, and how many shuffled
+# negatives to contrast each real ordering against. Few mixes are fine because the
+# order-summary feature space is tiny.
+_ORDER_MIN_MIXES = 2
+_ORDER_SHUFFLES_PER_MIX = 8
 
 # Named target arcs over normalised position p in [0, 1].
 _ARC_TARGETS = {
@@ -75,6 +93,9 @@ class ArcModelArtifact:
     hidden_dim: int = 64
     state_dict: dict[str, np.ndarray] = field(default_factory=dict)
     training_summary: dict[str, Any] = field(default_factory=dict)
+    # Torch-free order classifier (sklearn pipeline) and its feature width.
+    order_model: Any = None
+    feature_dim: int = 0
 
     def score_path(self, df: pd.DataFrame, path: list[int]) -> float:
         return score_ordering(self, df, path)
@@ -84,17 +105,38 @@ def heuristic_arc_model(arc: str = DEFAULT_ARC) -> ArcModelArtifact:
     return ArcModelArtifact(backend='heuristic', arc=arc)
 
 
+def _blend_learned(prob: float, df: pd.DataFrame, path: list[int], arc: str) -> float:
+    # Blend learned progression score with arc fit so both the learned structure
+    # and the target shape count; arc fit is the stable prior.
+    return float(np.clip(0.6 * float(prob) + 0.4 * arc_fit(df, path, arc=arc), 0.0, 1.0))
+
+
 def score_ordering(artifact: ArcModelArtifact | None, df: pd.DataFrame, path: list[int]) -> float:
     """Score a candidate ordering in [0, 1]. Falls back to arc fit when needed."""
     arc = artifact.arc if artifact is not None else DEFAULT_ARC
-    if artifact is None or artifact.backend != 'torch' or not artifact.state_dict:
+    if artifact is None or len(path) < 3:
+        return arc_fit(df, path, arc=arc)
+
+    backend = getattr(artifact, 'backend', 'heuristic')
+
+    if backend == 'order_clf' and getattr(artifact, 'order_model', None) is not None:
+        try:
+            embeddings, _ = compute_track_embeddings(df)
+            features = _order_summary_features(df, path, embeddings).reshape(1, -1)
+            if features.shape[1] != int(getattr(artifact, 'feature_dim', features.shape[1])):
+                return arc_fit(df, path, arc=arc)
+            prob = float(artifact.order_model.predict_proba(features)[0, 1])
+            return _blend_learned(prob, df, path, arc)
+        except Exception:
+            logger.exception('Order arc model scoring failed; using arc fit.')
+            return arc_fit(df, path, arc=arc)
+
+    if backend != 'torch' or not artifact.state_dict:
         return arc_fit(df, path, arc=arc)
     try:  # pragma: no cover - optional heavy path
         embeddings, _ = compute_track_embeddings(df)
         prob = _torch_score_sequence(artifact, embeddings[path])
-        # Blend learned progression score with arc fit so both shape and learned
-        # structure count; arc fit is the stable prior.
-        return float(np.clip(0.6 * prob + 0.4 * arc_fit(df, path, arc=arc), 0.0, 1.0))
+        return _blend_learned(prob, df, path, arc)
     except Exception:
         logger.exception('Arc model torch scoring failed; using arc fit.')
         return arc_fit(df, path, arc=arc)
@@ -126,27 +168,144 @@ def _reconstruct_mix_sequences(training_df: pd.DataFrame) -> list[list[int]]:
     return sequences
 
 
+def _order_summary_features(
+    df: pd.DataFrame,
+    path: list[int],
+    embeddings: np.ndarray | None = None,
+) -> np.ndarray:
+    """A small, fixed-width description of an ordering's *shape* and smoothness.
+
+    Deliberately low-dimensional (11 scalars) so the order classifier generalises
+    from a handful of mixes instead of overfitting per-track embeddings.
+    """
+    curve = _arousal_curve(df, path)
+    n = len(curve)
+    if n == 0:
+        curve = np.array([0.5], dtype=np.float64)
+        n = 1
+    diffs = np.diff(curve) if n > 1 else np.zeros(1, dtype=np.float64)
+    positions = np.linspace(0.0, 1.0, num=n)
+    target = _ARC_TARGETS[DEFAULT_ARC](positions)
+
+    feats = [
+        float(np.mean(np.abs(diffs))),                       # roughness
+        float(np.std(curve)),                                # dynamic spread
+        float(curve[0]),                                     # opener energy
+        float(curve[-1]),                                    # closer energy
+        float(np.max(curve) - np.min(curve)),                # energy span
+        float(np.argmax(curve)) / float(max(n - 1, 1)),      # peak position
+        float(np.mean((diffs > 0).astype(np.float64))) if diffs.size else 0.5,  # rise share
+        float(np.mean(np.abs(curve - target))),              # arc shape error
+    ]
+
+    if embeddings is not None and len(path) > 1:
+        seq = embeddings[path]
+        numerator = np.sum(seq[:-1] * seq[1:], axis=1)
+        denominator = (np.linalg.norm(seq[:-1], axis=1) * np.linalg.norm(seq[1:], axis=1)) + 1e-8
+        consecutive = numerator / denominator
+        feats.extend([float(np.mean(consecutive)), float(np.min(consecutive)), float(np.std(consecutive))])
+    else:
+        feats.extend([0.0, 0.0, 0.0])
+
+    return np.nan_to_num(np.asarray(feats, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _train_order_classifier(
+    frame: pd.DataFrame,
+    sequences: list[list[int]],
+    *,
+    arc: str,
+    random_state: int,
+    shuffles_per_mix: int,
+) -> ArcModelArtifact | None:
+    """Torch-free learned arc tier: logistic regression on real vs shuffled order."""
+    embeddings, embedding_source = compute_track_embeddings(frame)
+    rng = np.random.default_rng(int(random_state))
+
+    rows: list[np.ndarray] = []
+    labels: list[float] = []
+    for sequence in sequences:
+        if len(sequence) < 3:
+            continue
+        rows.append(_order_summary_features(frame, sequence, embeddings))
+        labels.append(1.0)
+        for _ in range(int(shuffles_per_mix)):
+            shuffled = list(sequence)
+            rng.shuffle(shuffled)
+            rows.append(_order_summary_features(frame, shuffled, embeddings))
+            labels.append(0.0)
+
+    if len(rows) < 4 or len(set(labels)) < 2:
+        return None
+
+    features = np.vstack(rows)
+    targets = np.asarray(labels, dtype=int)
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),
+        ('classifier', LogisticRegression(max_iter=1000, class_weight='balanced')),
+    ])
+    pipeline.fit(features, targets)
+
+    summary = {
+        'backend': 'order_clf',
+        'mixes': len(sequences),
+        'samples': int(len(targets)),
+        'shuffles_per_mix': int(shuffles_per_mix),
+        'embedding_source': embedding_source,
+    }
+    logger.info(
+        'Trained torch-free order arc model on %d mixes (%d samples, %d features).',
+        len(sequences), len(targets), int(features.shape[1]),
+    )
+    return ArcModelArtifact(
+        backend='order_clf', arc=arc, order_model=pipeline,
+        feature_dim=int(features.shape[1]), training_summary=summary,
+    )
+
+
 def train_arc_model(
     training_df: pd.DataFrame,
     *,
     arc: str = DEFAULT_ARC,
     random_state: int = 42,
     epochs: int = 40,
+    shuffles_per_mix: int = _ORDER_SHUFFLES_PER_MIX,
 ) -> ArcModelArtifact:
-    """Train the sequence arc model; returns a heuristic artifact if torch absent."""
-    if not _torch_available():
-        logger.info('PyTorch not available; arc model uses the heuristic arc fit.')
-        return heuristic_arc_model(arc)
+    """Train the best available arc tier; falls back to the heuristic arc fit.
 
-    sequences = _reconstruct_mix_sequences(training_df.reset_index(drop=True))
-    if len(sequences) < 4:
-        logger.info('Too few reconstructable mixes (%d) for a learned arc model; using heuristic.', len(sequences))
-        return heuristic_arc_model(arc)
+    Tiers, in order of preference: a PyTorch GRU when torch is present and there
+    are enough mixes; otherwise a torch-free order classifier (low-data); else the
+    heuristic.
+    """
+    frame = add_sentiment_features(training_df.reset_index(drop=True))
+    sequences = _reconstruct_mix_sequences(frame)
 
+    if _torch_available() and len(sequences) >= 4:
+        return _train_torch_arc_model(frame, sequences, arc=arc, random_state=random_state, epochs=epochs)
+
+    if len(sequences) >= _ORDER_MIN_MIXES:
+        order_model = _train_order_classifier(
+            frame, sequences, arc=arc, random_state=random_state, shuffles_per_mix=shuffles_per_mix,
+        )
+        if order_model is not None:
+            return order_model
+
+    logger.info('Too few reconstructable mixes (%d) for a learned arc model; using heuristic.', len(sequences))
+    return heuristic_arc_model(arc)
+
+
+def _train_torch_arc_model(
+    frame: pd.DataFrame,
+    sequences: list[list[int]],
+    *,
+    arc: str,
+    random_state: int,
+    epochs: int,
+) -> ArcModelArtifact:
     import torch
     from torch import nn
 
-    frame = add_sentiment_features(training_df.reset_index(drop=True))
     embeddings, _ = compute_track_embeddings(frame)
     input_dim = int(embeddings.shape[1])
     rng = np.random.default_rng(int(random_state))

@@ -22,6 +22,7 @@ from .sequence_model import (
     train_arc_model,
 )
 from .transition_model import (
+    DEFAULT_TRANSITION_MODEL_BACKEND,
     DEFAULT_TRANSITION_MODEL_DEVICE,
     DEFAULT_TRANSITION_MODEL_HARD_FRACTION,
     DEFAULT_TRANSITION_MODEL_NEGATIVE_RATIO,
@@ -66,6 +67,12 @@ def _build_parser(config: dict) -> argparse.ArgumentParser:
         default=str(get_config_value(config, 'training.transition_model_device', DEFAULT_TRANSITION_MODEL_DEVICE)),
     )
     parser.add_argument(
+        '--model-backend',
+        choices=['auto', 'forest', 'knn'],
+        default=str(get_config_value(config, 'training.transition_model_backend', DEFAULT_TRANSITION_MODEL_BACKEND)),
+        help="CPU estimator family. 'auto' uses kNN when positives are scarce, RandomForest otherwise.",
+    )
+    parser.add_argument(
         '--arc-profile',
         default=str(get_config_value(config, 'training.arc_profile', DEFAULT_ARC)),
     )
@@ -95,17 +102,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         hard_fraction=args.hard_fraction,
         random_state=args.random_state,
         device=args.device,
+        model_backend=args.model_backend,
     )
     save_transition_model(transition_model, args.transition_model_out)
     summary = transition_model.training_summary
     cv_auc = summary.get('cv_auc')
+    recommended_weight = summary.get('recommended_weight')
     print(
         f"Transition model -> {args.transition_model_out}\n"
         f"  positives={summary.get('positive_rows')} negatives={summary.get('negative_rows')} "
         f"features={summary.get('feature_count')} (musical={summary.get('musical_feature_count')})\n"
-        f"  hard_fraction={summary.get('hard_fraction')} backend={summary.get('backend')} "
+        f"  hard_fraction={summary.get('hard_fraction')} backend={summary.get('backend')}/{summary.get('estimator')} "
         f"device={summary.get('resolved_device')}\n"
-        f"  cv_auc={'n/a' if cv_auc is None else f'{cv_auc:.3f}'}"
+        f"  cv_auc={'n/a' if cv_auc is None else f'{cv_auc:.3f}'} "
+        f"recommended --transition-model-weight={recommended_weight}"
     )
 
     if not args.skip_arc_model:

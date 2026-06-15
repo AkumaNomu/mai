@@ -29,13 +29,15 @@ from the scraper's positive-transition CSV:
 - `hard_negatives.py` — mines close-but-unchosen negatives from real positives.
 - `embeddings.py` — per-track vector (descriptor embedding always on; pretrained
   MERT/CLAP encoder seam behind `MAI_AUDIO_ENCODER`).
-- `transition_model.py` — supervised pairwise scorer (RandomForest / torch MLP),
-  trained on positives + hard negatives, reporting cross-validated AUC.
+- `transition_model.py` — supervised pairwise scorer (kNN / RandomForest / torch
+  MLP, the CPU family auto-chosen by data size), trained on positives + hard
+  negatives, reporting cross-validated AUC and a shrunk recommended blend weight.
 - `beat_align.py` — beat-grid / phrase compatibility at the splice point.
 - `cross_modal.py` — mood-continuity grounding that rewards seamless cross-genre
   jumps (CLAP upgrade seam).
-- `sequence_model.py` — set-level arc model (energy/arousal arc fit always on;
-  optional learned GRU over track embeddings).
+- `sequence_model.py` — set-level arc model: energy/arousal arc fit always on; a
+  torch-free order classifier (real vs shuffled order) as the low-data learned
+  tier; an optional GRU over track embeddings when torch and enough mixes exist.
 - `playlist_generation.py` — directed transition matrix + beam search + 2-opt
   refinement + arc orientation.
 
@@ -126,6 +128,24 @@ training-data precision could not be tuned.
 env-tunable gates at the candidate-selection point (`training_scrape`).
 **Why.** Cleaner positives directly raise the transition model's ceiling;
 precision/recall is now a dial, not a code edit.
+
+### 10. Low-data regime: order self-supervision, kNN, adaptive shrinkage
+**Problem.** Curating scraped DJ mixes yields tens — not thousands — of labelled
+handoffs. A deep pairwise classifier and a GRU both overfit at that scale, and a
+fixed learned-model weight lets a noisy model overpower the heuristics.
+**Method.** Three sample-efficient choices. (a) A *torch-free order classifier*
+(`sequence_model._train_order_classifier`): each real mix order is contrasted
+against many shuffles, described by ~11 order-summary scalars (arc shape,
+roughness, embedding smoothness), and separated by logistic regression — the
+always-on learned arc tier, with the GRU reserved for when torch and ample mixes
+are both present. (b) A *kNN transition backend* auto-selected when positives are
+scarce (`transition_model._resolve_estimator`), since distance-weighted
+neighbours generalise without deep trees to overfit. (c) *Adaptive shrinkage*
+(`recommend_transition_model_weight`): the suggested blend weight scales with CV
+AUC above chance and with the positive count, and is 0 when AUC is unavailable.
+**Why.** The order of any curated playlist is free supervision — no transition
+labelling needed — so the learned signal grows with every scrape, while the
+heuristic core (sections 2, 4, 5) keeps quality high from the very first run.
 
 ## Training and use
 

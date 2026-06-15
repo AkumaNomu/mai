@@ -54,6 +54,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         'label_source': 'youtube_mix_curation',
         'transition_model_hard_fraction': 0.8,
         'transition_model_negative_ratio': 1.0,
+        'transition_model_backend': 'auto',
         'arc_model_path': 'data/cache/arc_model.joblib',
         'arc_profile': 'rise_peak_cool',
         'videos': [],

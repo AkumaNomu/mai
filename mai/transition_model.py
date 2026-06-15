@@ -12,7 +12,9 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from .hard_negatives import MODEL_TARGET_COLUMN, build_training_table
 from .musical_features import (
@@ -30,6 +32,10 @@ DEFAULT_TRANSITION_MODEL_NEGATIVE_RATIO = 1.0
 DEFAULT_TRANSITION_MODEL_HARD_FRACTION = 0.8
 DEFAULT_TRANSITION_MODEL_RANDOM_STATE = 42
 DEFAULT_TRANSITION_MODEL_DEVICE = 'cuda'
+DEFAULT_TRANSITION_MODEL_BACKEND = 'auto'
+# Below this many positives, a distance-weighted kNN generalises more safely than
+# a RandomForest (no deep trees to overfit a handful of labels).
+_KNN_AUTO_MAX_POSITIVES = 80
 
 _TIMESTAMP_RE = re.compile(r'^\s*(?:(\d+):)?([0-5]?\d):([0-5]\d)\s*$')
 _EXCLUDED_BASE_COLUMNS = {
@@ -494,6 +500,43 @@ def _cross_validated_auc(features: np.ndarray, targets: np.ndarray, random_state
         return None
 
 
+def _resolve_estimator(model_backend: str, positive_rows: int) -> str:
+    """Pick the CPU estimator family. 'auto' uses kNN when positives are scarce."""
+    choice = str(model_backend or 'auto').strip().lower()
+    if choice in {'forest', 'rf', 'randomforest'}:
+        return 'forest'
+    if choice in {'knn', 'neighbors', 'neighbours'}:
+        return 'knn'
+    if choice in {'auto', ''}:
+        return 'knn' if positive_rows < _KNN_AUTO_MAX_POSITIVES else 'forest'
+    raise ValueError(f'invalid transition model backend: {model_backend}')
+
+
+def _build_knn_pipeline(positive_rows: int, sample_count: int, random_state: int) -> Pipeline:
+    # k scales with data but stays small; never exceeds the available samples.
+    k = int(min(15, max(3, positive_rows // 3)))
+    k = max(1, min(k, max(sample_count - 1, 1)))
+    return Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),
+        ('classifier', KNeighborsClassifier(n_neighbors=k, weights='distance')),
+    ])
+
+
+def recommend_transition_model_weight(cv_auc: float | None, positive_rows: int) -> float:
+    """Suggested blend weight for the learned scorer, shrunk toward 0 on weak data.
+
+    Maps CV AUC above chance (0.5 -> 0.0, >=0.8 -> full lift) and scales it down
+    when there are few positives, so a noisy small model never dominates the
+    hand-built heuristics. Returns 0.0 when AUC is unavailable (untrustworthy).
+    """
+    if cv_auc is None:
+        return 0.0
+    lift = float(np.clip((float(cv_auc) - 0.5) / 0.3, 0.0, 1.0))
+    data_factor = float(np.clip(positive_rows / 200.0, 0.2, 1.0))
+    return round(0.45 * lift * data_factor, 3)
+
+
 def train_transition_model(
     training_df: pd.DataFrame,
     *,
@@ -501,6 +544,7 @@ def train_transition_model(
     hard_fraction: float = DEFAULT_TRANSITION_MODEL_HARD_FRACTION,
     random_state: int = DEFAULT_TRANSITION_MODEL_RANDOM_STATE,
     device: str = DEFAULT_TRANSITION_MODEL_DEVICE,
+    model_backend: str = DEFAULT_TRANSITION_MODEL_BACKEND,
 ) -> TransitionModelArtifact:
     """Train a supervised transition model from positive rows plus hard negatives."""
     training_pairs, label_stats = build_training_table(
@@ -524,20 +568,28 @@ def train_transition_model(
     if requested_device == 'auto':
         resolved_device = 'cuda' if _torch_cuda_available() else 'cpu'
 
+    positive_rows = int(label_stats['positive_rows'])
+    estimator_kind = 'torch'
     if resolved_device == 'cuda':
         payload = _train_torch_transition_model(features, y, random_state=int(random_state), device='cuda')
         backend = 'torch'
         model = payload
     else:
         backend = 'sklearn'
-        model = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('classifier', RandomForestClassifier(
-                n_estimators=300, min_samples_leaf=2,
-                class_weight='balanced_subsample', random_state=int(random_state),
-            )),
-        ])
+        estimator_kind = _resolve_estimator(model_backend, positive_rows)
+        if estimator_kind == 'knn':
+            model = _build_knn_pipeline(positive_rows, len(y), int(random_state))
+        else:
+            model = Pipeline([
+                ('imputer', SimpleImputer(strategy='median')),
+                ('classifier', RandomForestClassifier(
+                    n_estimators=300, min_samples_leaf=2,
+                    class_weight='balanced_subsample', random_state=int(random_state),
+                )),
+            ])
         model.fit(features_df, y.astype(int))
+
+    recommended_weight = recommend_transition_model_weight(cv_auc, positive_rows)
 
     summary = {
         'positive_rows': int(label_stats['positive_rows']),
@@ -551,15 +603,18 @@ def train_transition_model(
         'hard_fraction': float(hard_fraction),
         'cv_auc': cv_auc,
         'backend': backend,
+        'estimator': estimator_kind,
+        'recommended_weight': recommended_weight,
         'requested_device': requested_device,
         'resolved_device': resolved_device,
     }
     logger.info(
         'Trained transition model: %d positive, %d negative, %d features (incl. %d musical), '
-        'CV AUC=%s, backend=%s (%s).',
+        'CV AUC=%s, backend=%s/%s (%s), recommended weight=%.3f.',
         summary['positive_rows'], summary['negative_rows'], summary['feature_count'],
         summary['musical_feature_count'],
-        'n/a' if cv_auc is None else f'{cv_auc:.3f}', backend, resolved_device,
+        'n/a' if cv_auc is None else f'{cv_auc:.3f}', backend, estimator_kind, resolved_device,
+        recommended_weight,
     )
     return TransitionModelArtifact(
         pipeline=model, feature_spec=feature_spec, training_summary=summary,

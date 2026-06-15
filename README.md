@@ -67,7 +67,9 @@ Train both models from a scraped positive-transitions CSV:
 ```powershell
 python -m mai.train --train-csv data/training/positive_transitions.csv
 ```
-Outputs `data/cache/transition_model.joblib` (pairwise) and `data/cache/arc_model.joblib` (set-level arc). The transition model uses hard-negative mining (close-but-unchosen alternatives) and Camelot/tempo/mood interaction features, and prints a cross-validated AUC so you can judge data quality before generating. Key flags: `--negative-ratio`, `--hard-fraction`, `--device {cuda,cpu,auto}`, `--arc-profile {rise_peak_cool,rise,plateau,cool_down}`, `--skip-arc-model`.
+Outputs `data/cache/transition_model.joblib` (pairwise) and `data/cache/arc_model.joblib` (set-level arc). The transition model uses hard-negative mining (close-but-unchosen alternatives) and Camelot/tempo/mood interaction features, and prints a cross-validated AUC so you can judge data quality before generating. Key flags: `--negative-ratio`, `--hard-fraction`, `--model-backend {auto,forest,knn}`, `--device {cuda,cpu,auto}`, `--arc-profile {rise_peak_cool,rise,plateau,cool_down}`, `--skip-arc-model`.
+
+Built for small datasets. With only a handful of scraped mixes the trainer leans on sample-efficient choices automatically: `--model-backend auto` picks a distance-weighted kNN when labelled positives are scarce (RandomForest once they are plentiful); the arc model learns from playlist *order* (real vs shuffled mixes) with a torch-free classifier, so no transition labelling is needed; and training prints a `recommended --transition-model-weight` that is shrunk toward 0 when AUC or data are weak, so the hand-built heuristics stay in charge until the learned model earns trust.
 
 Use a trained model when generating:
 ```powershell
