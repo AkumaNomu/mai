@@ -98,6 +98,21 @@ def scene_to_prompt(*args, **kwargs):
     return _scene_to_prompt(*args, **kwargs)
 
 
+def plan_mix(*args, **kwargs):
+    from .overlay import plan_mix as _plan_mix
+    return _plan_mix(*args, **kwargs)
+
+
+def best_overlay(*args, **kwargs):
+    from .overlay import best_overlay as _best_overlay
+    return _best_overlay(*args, **kwargs)
+
+
+def overlay_score(*args, **kwargs):
+    from .overlay import overlay_score as _overlay_score
+    return _overlay_score(*args, **kwargs)
+
+
 def analyze_youtube_playlist_audio(*args, **kwargs):
     from .audio_analysis import analyze_youtube_playlist_audio as _analyze_youtube_playlist_audio
     return _analyze_youtube_playlist_audio(*args, **kwargs)
@@ -124,4 +139,5 @@ __all__ = [
     'score_library_against_scene', 'build_scene_index', 'run_benchmark',
     'compare_retrievers', 'fit_affect_probe', 'load_benchmark', 'ingest_cue_sheets',
     'query_scene_index', 'paired_bootstrap_test', 'scene_to_prompt',
+    'plan_mix', 'best_overlay', 'overlay_score',
 ]

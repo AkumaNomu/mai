@@ -105,6 +105,29 @@ image↔music space from cue-sheet pairs (symmetric InfoNCE, torch-guarded); and
 turns a scene's affect into a MusicGen prompt so a fitting track can be *generated*
 when none exists in the library (torch-guarded).
 
+### DJ-style overlay transitions (mid-song mixing)
+`mai.overlay` models a transition the way a DJ does — as a *region overlay*, not a
+point cut. Each track is segmented into mixable sections (Foote-novelty
+boundaries), and a transition is chosen as `(exit_region_A, entry_region_B,
+beat_offset, blend_type, score)`, where the entry can be mid-song (a breakdown, an
+instrumental, a drop). The score blends octave-aware tempo lock, Camelot key
+match, a hard vocal-clash penalty (never stack two vocals), phrase alignment, and
+**spectral complementarity** — rewarding region pairs that fill *different*
+frequency pockets (A's bass under B's highs) rather than ones that merely sound
+alike. Downbeats are aligned by FFT onset cross-correlation, and a blend type is
+picked per pair (`long_blend`, `bass_swap`, `double_drop`, `echo_out`,
+`loop_roll`, `cut`).
+```python
+from mai.overlay import plan_mix      # regions_by_track: {track_id: [RegionDescriptor, ...]}
+mix = plan_mix(regions_by_track, order=['a', 'b', 'c'])
+for hop in mix:
+    print(hop.exit_region.track_id, '→', hop.entry_region.track_id,
+          hop.blend_type, f'offset={hop.beat_offset}', f'score={hop.score:.2f}')
+```
+The hot kernels are vectorised numpy (FFT cross-correlation, broadcast band
+collision); the Foote-novelty diagonal scan has a Numba `njit` fast path that
+degrades to the exact numpy reference when Numba is absent.
+
 ### Training scrape (positive transitions)
 ```powershell
 python -m mai.training_scrape --config mai.toml
