@@ -332,31 +332,45 @@ def _track_feature_matrix(df: pd.DataFrame, spec: TransitionFeatureSpec) -> np.n
     feature_matrix = np.zeros((rows * rows, len(spec.feature_names)), dtype=np.float32)
     column_index = 0
 
-    for base in spec.numeric_columns:
-        values = _track_numeric_array(df, base)
-        left = np.repeat(values, rows)
-        right = np.tile(values, rows)
-        delta = right - left
-        feature_matrix[:, column_index] = left
-        feature_matrix[:, column_index + 1] = right
-        feature_matrix[:, column_index + 2] = delta
-        feature_matrix[:, column_index + 3] = np.abs(delta)
-        feature_matrix[:, column_index + 4] = 0.5 * (left + right)
-        column_index += 5
+    # Iterate base columns in the same order ``feature_names`` was built (numeric
+    # and text bases interleave when sorted), so each 5-column block lands in the
+    # exact slot its name occupies in the training feature frame. Filling all
+    # numeric blocks first and all text blocks second would scramble columns
+    # relative to training and silently corrupt every scored transition.
+    numeric_bases = set(spec.numeric_columns)
+    text_bases = set(spec.text_columns)
 
-    for base in spec.text_columns:
-        text_values = _text_series(_track_series(df, base)).to_numpy()
-        lengths = _track_text_length_array(df, base)
-        left = np.repeat(lengths, rows)
-        right = np.tile(lengths, rows)
-        delta = right - left
-        same = np.asarray(np.repeat(text_values, rows) == np.tile(text_values, rows), dtype=np.float32)
-        feature_matrix[:, column_index] = left
-        feature_matrix[:, column_index + 1] = right
-        feature_matrix[:, column_index + 2] = delta
-        feature_matrix[:, column_index + 3] = np.abs(delta)
-        feature_matrix[:, column_index + 4] = same
-        column_index += 5
+    for base in spec.base_columns:
+        if base in numeric_bases:
+            values = _track_numeric_array(df, base)
+            left = np.repeat(values, rows)
+            right = np.tile(values, rows)
+            delta = right - left
+            feature_matrix[:, column_index] = left
+            feature_matrix[:, column_index + 1] = right
+            feature_matrix[:, column_index + 2] = delta
+            feature_matrix[:, column_index + 3] = np.abs(delta)
+            feature_matrix[:, column_index + 4] = 0.5 * (left + right)
+            column_index += 5
+        elif base in text_bases:
+            text_values = _text_series(_track_series(df, base)).to_numpy()
+            lengths = _track_text_length_array(df, base)
+            left = np.repeat(lengths, rows)
+            right = np.tile(lengths, rows)
+            delta = right - left
+            left_text = np.repeat(text_values, rows)
+            right_text = np.tile(text_values, rows)
+            # Match the training path: two empty strings are not a "same" match.
+            same = np.asarray(
+                (left_text != '') & (right_text != '') & (left_text == right_text),
+                dtype=np.float32,
+            )
+            feature_matrix[:, column_index] = left
+            feature_matrix[:, column_index + 1] = right
+            feature_matrix[:, column_index + 2] = delta
+            feature_matrix[:, column_index + 3] = np.abs(delta)
+            feature_matrix[:, column_index + 4] = same
+            column_index += 5
 
     musical = _musical_features_matrix(df, rows)
     for name in spec.musical_feature_names:
