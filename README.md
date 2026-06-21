@@ -128,6 +128,16 @@ The hot kernels are vectorised numpy (FFT cross-correlation, broadcast band
 collision); the Foote-novelty diagonal scan has a Numba `njit` fast path that
 degrades to the exact numpy reference when Numba is absent.
 
+`mai.mix_planner` bridges this to a real playlist: it builds per-track regions
+from the audio columns (`intro`/`body`/`outro`), runs `plan_mix` over the order,
+and exports a cue sheet. CLI:
+```powershell
+python -m mai.mix_planner --csv data/Playlist_reordered.csv --out data/mix_plan.csv
+```
+The cue sheet has one row per transition (`from_track`, `to_track`, `blend_type`,
+`beat_offset`, `score`, exit/entry positions, component scores) for a DJ tool or
+the existing exporters to consume.
+
 ### Training scrape (positive transitions)
 ```powershell
 python -m mai.training_scrape --config mai.toml

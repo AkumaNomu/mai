@@ -113,6 +113,16 @@ def overlay_score(*args, **kwargs):
     return _overlay_score(*args, **kwargs)
 
 
+def plan_mix_from_dataframe(*args, **kwargs):
+    from .mix_planner import plan_mix_from_dataframe as _plan_mix_from_dataframe
+    return _plan_mix_from_dataframe(*args, **kwargs)
+
+
+def export_cue_sheet(*args, **kwargs):
+    from .mix_planner import export_cue_sheet as _export_cue_sheet
+    return _export_cue_sheet(*args, **kwargs)
+
+
 def analyze_youtube_playlist_audio(*args, **kwargs):
     from .audio_analysis import analyze_youtube_playlist_audio as _analyze_youtube_playlist_audio
     return _analyze_youtube_playlist_audio(*args, **kwargs)
@@ -140,4 +150,5 @@ __all__ = [
     'compare_retrievers', 'fit_affect_probe', 'load_benchmark', 'ingest_cue_sheets',
     'query_scene_index', 'paired_bootstrap_test', 'scene_to_prompt',
     'plan_mix', 'best_overlay', 'overlay_score',
+    'plan_mix_from_dataframe', 'export_cue_sheet',
 ]
