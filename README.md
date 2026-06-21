@@ -47,6 +47,64 @@ python run.py --youtube-playlist <PLAYLIST_URL_OR_ID>
 Key flags: `--playlist-size`, `--num-playlists`, `--allow-reuse`, `--beam-width`, `--candidate-width`, `--max-tracks`, `--edge-seconds`, `--silence-top-db`, `--flow-profile`, `--resource-profile`, `--download-workers`, `--analysis-workers`, `--refresh-cache/--no-refresh-cache`, `--audio-cache`, `--delete-audio-after-analysis/--keep-audio-cache`, `--rate-transitions`, `--transition-report-out`, `--print-recommended-order`, `--input-order-column`, `--create-ytmusic`, `--ytmusic-auth`, `--ytmusic-title`, `--ytmusic-privacy`, `--create-youtube`, `--youtube-client-secrets`, `--youtube-token`, `--youtube-title`, `--youtube-privacy`.
 Outputs: `data/Playlist_reordered.csv` for full reorders, otherwise `data/Generated_playlists.csv`, plus optional transition report CSV.
 
+### Scene → music (image + context matching)
+Pick songs that fit a still frame (a movie scene, a photo, cover art). Mai reads
+the image's colour and light — dominant palette, brightness, saturation, contrast,
+warm/cool balance — and projects it into the same `valence / arousal / tension /
+warmth` mood space the audio side uses, then ranks a track library by mood fit. A
+free-text scene description adds narrative context (a red frame is a sunset romance
+or a burning battlefield; the words disambiguate) and soft genre hints.
+```powershell
+python -m mai.scene_match --csv data/Library.csv --image scene.jpg `
+  --scene-text "a tense chase through the city at night" --top-k 15 --order
+```
+Key flags: `--image`, `--scene-text` (either or both), `--text-weight` (blend of
+caption vs colour mood, default 0.5), `--top-k`, `--order` (reorder the matches
+into a flowing sequence via the transition engine), `--out` (write ranked CSV).
+The colour path needs only `pillow`; set `MAI_CLIP_MODEL` (with `torch` +
+`transformers`) to ground the image against mood/genre prompts in a learned CLIP
+space, mirroring the audio side's CLAP seam.
+
+### Scaling to large pools & evaluation
+For a large catalogue, `mai.scene_index.SceneIndex` runs a staged retrieval funnel
+so the expensive scene scorer only touches a few thousand survivors per query:
+`hard filter (metadata) → ANN recall (mood space) → exact rerank → diversify
+(MMR or k-DPP) → optional order`. Each stage has a fast path and an exact
+numpy/pandas fallback: filtering uses Polars predicate pushdown when installed;
+ANN recall auto-selects hnswlib → usearch → Faiss IVF-PQ (else an exact numpy
+scan); `quantize_int8` gives a 4× coarse prefilter. The index persists as Parquet
++ npz (`save_parquet`, mmap-friendly) or a single pickle, supports incremental
+`add`, and `query_batch` scores many scenes in one BLAS matmul for throughput.
+```python
+from mai.scene_index import build_scene_index
+from mai.scene_match import build_scene_target
+index = build_scene_index(library_df)                       # precompute once
+target = build_scene_target(scene_text='a neon city chase at night')
+hits = index.query(target, filters={'tempo': {'min': 110, 'max': 140}},
+                   recall_k=2000, top_k=20, diversify=True, order=True)
+```
+
+The matcher is measurable, not just demoable. `mai.scene_eval` provides ranking
+metrics (P@k, R@k, MRR, MAP, nDCG) and baseline retrievers (random, genre-lexicon,
+CLAP seam) behind one `Retriever` protocol; `compare_retrievers` tabulates them on
+a labelled benchmark. `mai.scene_dataset` defines the MAI-Bench JSONL schema, a
+validator, a `make_synthetic_benchmark` smoke harness, and `ingest_cue_sheets` to
+turn film/TV cue sheets (real scene↔track ground truth) into labelled examples.
+
+For rigor, `scene_eval` also provides ablation flags on the Mai retriever
+(`use_image` / `use_text` / `use_genre_boost`), bootstrap confidence intervals
+(`bootstrap_ci`), and a paired bootstrap significance test (`paired_bootstrap_test`)
+so a win over a baseline comes with a p-value, not just a higher number.
+
+Three learned upgrades sit behind the always-on affect baseline: `mai.affect_probe`
+distils any frozen embedding (CLAP/CLIP/MERT/descriptor) into the interpretable
+`valence/arousal/tension/warmth` axes via a closed-form ridge probe (no torch,
+weights are the explanation); `mai.cross_modal_model` trains a CLIP-style joint
+image↔music space from cue-sheet pairs (symmetric InfoNCE, torch-guarded); and
+`mai.scene_generation` closes the retrieval⊕generation loop — `scene_to_prompt`
+turns a scene's affect into a MusicGen prompt so a fitting track can be *generated*
+when none exists in the library (torch-guarded).
+
 ### Training scrape (positive transitions)
 ```powershell
 python -m mai.training_scrape --config mai.toml

@@ -35,6 +35,69 @@ def analyze_audio_file(*args, **kwargs):
     return _analyze_audio_file(*args, **kwargs)
 
 
+from .scene_context import analyze_scene_text  # lexicon-only, no heavy deps
+
+
+def analyze_scene_image(*args, **kwargs):
+    from .scene_features import analyze_scene_image as _analyze_scene_image
+    return _analyze_scene_image(*args, **kwargs)
+
+
+def build_scene_target(*args, **kwargs):
+    from .scene_match import build_scene_target as _build_scene_target
+    return _build_scene_target(*args, **kwargs)
+
+
+def score_library_against_scene(*args, **kwargs):
+    from .scene_match import score_library_against_scene as _score_library_against_scene
+    return _score_library_against_scene(*args, **kwargs)
+
+
+def build_scene_index(*args, **kwargs):
+    from .scene_index import build_scene_index as _build_scene_index
+    return _build_scene_index(*args, **kwargs)
+
+
+def run_benchmark(*args, **kwargs):
+    from .scene_eval import run_benchmark as _run_benchmark
+    return _run_benchmark(*args, **kwargs)
+
+
+def compare_retrievers(*args, **kwargs):
+    from .scene_eval import compare_retrievers as _compare_retrievers
+    return _compare_retrievers(*args, **kwargs)
+
+
+def fit_affect_probe(*args, **kwargs):
+    from .affect_probe import fit_affect_probe as _fit_affect_probe
+    return _fit_affect_probe(*args, **kwargs)
+
+
+def load_benchmark(*args, **kwargs):
+    from .scene_dataset import load_benchmark as _load_benchmark
+    return _load_benchmark(*args, **kwargs)
+
+
+def ingest_cue_sheets(*args, **kwargs):
+    from .scene_dataset import ingest_cue_sheets as _ingest_cue_sheets
+    return _ingest_cue_sheets(*args, **kwargs)
+
+
+def query_scene_index(*args, **kwargs):
+    from .scene_index import query_scene_index as _query_scene_index
+    return _query_scene_index(*args, **kwargs)
+
+
+def paired_bootstrap_test(*args, **kwargs):
+    from .scene_eval import paired_bootstrap_test as _paired_bootstrap_test
+    return _paired_bootstrap_test(*args, **kwargs)
+
+
+def scene_to_prompt(*args, **kwargs):
+    from .scene_generation import scene_to_prompt as _scene_to_prompt
+    return _scene_to_prompt(*args, **kwargs)
+
+
 def analyze_youtube_playlist_audio(*args, **kwargs):
     from .audio_analysis import analyze_youtube_playlist_audio as _analyze_youtube_playlist_audio
     return _analyze_youtube_playlist_audio(*args, **kwargs)
@@ -56,5 +119,9 @@ __all__ = [
     'generate_playlist_paths', 'playlists_to_dataframe', 'ensure_genre_groups',
     'ordered_playlist_paths_from_dataframe', 'build_transition_report',
     'summarize_transition_report', 'transition_score_rating',
-    'load_youtube_service', 'create_youtube_playlist'
+    'load_youtube_service', 'create_youtube_playlist',
+    'analyze_scene_text', 'analyze_scene_image', 'build_scene_target',
+    'score_library_against_scene', 'build_scene_index', 'run_benchmark',
+    'compare_retrievers', 'fit_affect_probe', 'load_benchmark', 'ingest_cue_sheets',
+    'query_scene_index', 'paired_bootstrap_test', 'scene_to_prompt',
 ]
