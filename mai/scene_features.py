@@ -201,6 +201,12 @@ def analyze_scene_image(image_path: str) -> SceneFeatures:
 
     try:
         palette, palette_weights = _palette(rgb_flat, _PALETTE_SIZE)
+    except ImportError:
+        # scikit-learn not installed: mood stats are unaffected, only the
+        # KMeans palette degrades to the mean colour. Expected, not an error.
+        logger.debug('scikit-learn absent; reporting mean colour instead of a KMeans palette.')
+        mean_rgb = tuple(int(c) for c in np.clip(rgb_flat.mean(axis=0) * 255.0, 0, 255))
+        palette, palette_weights = [mean_rgb], [1.0]
     except Exception:
         logger.exception('Palette extraction failed; reporting mean colour only.')
         mean_rgb = tuple(int(c) for c in np.clip(rgb_flat.mean(axis=0) * 255.0, 0, 255))

@@ -282,6 +282,50 @@ def compare_retrievers(
     return frame[ordered]
 
 
+def main(argv=None) -> int:
+    """CLI: benchmark the scene retrievers on a MAI-Bench file (or a synthetic set)."""
+    import argparse
+    import logging
+
+    parser = argparse.ArgumentParser(description='Benchmark scene→music retrievers.')
+    parser.add_argument('--library', required=True, help='track library CSV.')
+    parser.add_argument('--benchmark', help='MAI-Bench .jsonl/.csv; omit to use a synthetic set.')
+    parser.add_argument('--ks', default='1,5,10', help='cutoffs, comma-separated (default 1,5,10).')
+    parser.add_argument('--use-index', action='store_true', help='back the Mai retriever with a SceneIndex.')
+    parser.add_argument('--significance', action='store_true', help='paired bootstrap: Mai vs random.')
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.WARNING, format='%(message)s')
+
+    library = pd.read_csv(args.library)
+    library.columns = [c.strip() for c in library.columns]
+    if args.benchmark:
+        from .scene_dataset import load_benchmark
+        examples = load_benchmark(args.benchmark)
+    else:
+        from .scene_dataset import make_synthetic_benchmark
+        examples = make_synthetic_benchmark(library)
+        print(f'No --benchmark given; using {len(examples)} SYNTHETIC scenes (harness check, not a real score).')
+
+    ks = tuple(int(x) for x in str(args.ks).split(',') if x.strip())
+    mai = MaiAffectRetriever(library=library, index=(SceneIndex.build(library) if args.use_index else None))
+    retrievers = [mai, GenreLexiconRetriever(library=library), RandomRetriever(library=library)]
+    if ClapRetriever.available():
+        print('CLAP available but needs precomputed audio features; skipping in CLI.')
+
+    table = compare_retrievers(retrievers, examples, ks=ks)
+    print('\n' + table.round(4).to_string())
+
+    if args.significance:
+        result = paired_bootstrap_test(mai, RandomRetriever(library=library), examples, metric='MRR', k=max(ks))
+        print(f'\nMai vs random (MRR@{max(ks)}): Δ={result["mean_diff"]:+.4f} '
+              f'CI[{result["ci_lo"]:+.4f},{result["ci_hi"]:+.4f}] p(Mai≤random)={result["p_value_a_le_b"]:.4f}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+
+
 # --------------------------------------------------------------------------- #
 # Statistical rigor: per-example samples, bootstrap CIs, paired significance.  #
 # --------------------------------------------------------------------------- #
